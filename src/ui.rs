@@ -21,3 +21,12 @@ pub fn spinner(msg: impl Into<String>) -> ProgressBar {
 pub fn stop(spinner: ProgressBar) {
     spinner.finish_and_clear();
 }
+
+pub fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Write};
+    print!("  {prompt} [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).ok();
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}

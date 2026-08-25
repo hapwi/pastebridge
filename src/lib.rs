@@ -11,6 +11,7 @@ pub mod service;
 pub mod sync;
 pub mod tls;
 pub mod ui;
+pub mod update;
 
 pub use config::Config;
 pub use identity::Identity;

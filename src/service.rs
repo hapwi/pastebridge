@@ -34,6 +34,21 @@ pub fn uninstall() -> Result<()> {
     }
 }
 
+pub fn restart() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        restart_systemd()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        restart_launchd()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("restart is only supported on Linux and macOS")
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn unit_path() -> Result<PathBuf> {
     let dir = dirs_config()?.join("systemd/user");
@@ -101,6 +116,19 @@ fn uninstall_systemd() -> Result<()> {
     }
     println!("  login service removed");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restart_systemd() -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user", "restart", "pastebridge.service"])
+        .status()
+        .context("running systemctl")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("systemctl restart failed")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -181,4 +209,23 @@ fn uninstall_launchd() -> Result<()> {
     }
     println!("  login service removed");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restart_launchd() -> Result<()> {
+    let uid = Command::new("id").arg("-u").output()?;
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    let status = Command::new("launchctl")
+        .args([
+            "kickstart",
+            "-k",
+            &format!("gui/{uid}/dev.pastebridge.daemon"),
+        ])
+        .status()
+        .context("running launchctl")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("launchctl kickstart failed")
+    }
 }

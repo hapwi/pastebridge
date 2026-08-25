@@ -4,7 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 use pastebridge::config::Paths;
 use pastebridge::identity::{Identity, PeerList};
-use pastebridge::{daemon, doctor, pairing, service, Config};
+use pastebridge::{daemon, doctor, pairing, service, update, Config};
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +36,12 @@ enum Command {
     Unpair { device_id: String },
     /// Check clipboard, ports, and pairing
     Doctor,
+    /// Download a newer Pastebridge if one is out
+    Update {
+        /// Update without asking
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Start Pastebridge automatically when you log in
     InstallService,
     /// Remove the login service
@@ -74,6 +80,7 @@ async fn real_main() -> Result<()> {
         Some(Command::List) => print_list(&paths),
         Some(Command::Unpair { device_id }) => unpair(&paths, &device_id),
         Some(Command::Doctor) => doctor::run(&cfg, &paths, &identity),
+        Some(Command::Update { yes }) => update::run(yes, &paths),
         Some(Command::InstallService) => service::install(),
         Some(Command::UninstallService) => service::uninstall(),
     }
