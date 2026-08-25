@@ -214,6 +214,9 @@ install_prebuilt() {
     fail "archive did not contain pastebridge"
   fi
   place_binary "$tmp/pastebridge"
+  if [[ "$(os_name)" == Darwin ]]; then
+    xattr -d com.apple.quarantine "$INSTALLED_BIN" >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmp"
 }
 

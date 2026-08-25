@@ -176,12 +176,23 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
         logs = logs.display()
     );
     fs::write(&path, plist)?;
+    if let Err(err) =
+        crate::macos_identity::prepare_executable(exe, &crate::config::Paths::new()?.config_dir)
+    {
+        tracing::warn!("could not keep macOS permissions on this binary: {err}");
+    }
     let uid = Command::new("id").arg("-u").output()?;
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
     let domain = format!("gui/{uid}");
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/dev.pastebridge.daemon")])
-        .status();
+    let label = format!("{domain}/dev.pastebridge.daemon");
+    let already = launchd_loaded(&label);
+    if already {
+        let _ = Command::new("launchctl")
+            .args(["kickstart", "-k", &label])
+            .status();
+        println!("  login service enabled");
+        return Ok(());
+    }
     let load = Command::new("launchctl")
         .args(["bootstrap", &domain, &path.display().to_string()])
         .status()?;
@@ -195,6 +206,14 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
         println!("  launchctl bootstrap gui/$UID {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_loaded(label: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", label])
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 #[cfg(target_os = "macos")]

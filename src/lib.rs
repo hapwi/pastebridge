@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod doctor;
 pub mod identity;
+pub mod macos_identity;
 pub mod pairing;
 pub mod protocol;
 pub mod service;

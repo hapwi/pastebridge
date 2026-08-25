@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>dev.pastebridge.pastebridge</string>
+  <key>CFBundleName</key>
+  <string>Pastebridge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Pastebridge finds your other computer on the local network to sync the clipboard.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_pastebridge._udp</string>
+    <string>_pastebridge-pair._udp</string>
+  </array>
+</dict>
+</plist>
