@@ -9,12 +9,10 @@ No account, no cloud, no extra window. Pair the two computers once. After that i
 On macOS or Linux:
 
 ```bash
-curl -fsSLo /tmp/pastebridge-install.sh https://hapwi.github.io/install/pastebridge.sh
-less /tmp/pastebridge-install.sh
-bash /tmp/pastebridge-install.sh
+curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
 ```
 
-Inspect the installer before running it. Rust and Cargo must already be installed.
+Rust and Cargo must already be installed.
 The installer builds Pastebridge and enables its user-level login service.
 
 Then pair both computers:

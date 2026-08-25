@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Download, inspect, and install Pastebridge:
-#   curl -fsSLo /tmp/pastebridge-install.sh https://hapwi.github.io/install/pastebridge.sh
-#   less /tmp/pastebridge-install.sh
-#   bash /tmp/pastebridge-install.sh
+# Install Pastebridge:
+#   curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
 set -euo pipefail
 
 REPO_HTTPS="https://github.com/hapwi/pastebridge"
@@ -72,7 +70,7 @@ ensure_macos_devtools() {
   fi
   fail "Xcode Command Line Tools are required. Run: xcode-select --install
 Then re-run:
-  bash /tmp/pastebridge-install.sh"
+  curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash"
 }
 
 ensure_linux_build() {
