@@ -17,4 +17,5 @@ service: install
 
 uninstall:
 	-pastebridge uninstall-service
+	-rm -f "$(HOME)/.local/bin/pastebridge"
 	-cargo uninstall pastebridge

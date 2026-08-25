@@ -12,8 +12,8 @@ On macOS or Linux:
 curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
 ```
 
-Rust and Cargo must already be installed.
-The installer builds Pastebridge and enables its user-level login service.
+That downloads a prebuilt binary and enables the user-level login service.
+Rust is not required.
 
 Then pair both computers:
 
@@ -115,7 +115,7 @@ after changing the configuration.
 
 ```bash
 pastebridge uninstall-service
-cargo uninstall pastebridge
+rm -f ~/.local/bin/pastebridge
 rm -rf ~/.config/pastebridge
 # macOS:
 # rm -rf ~/Library/Application\ Support/pastebridge

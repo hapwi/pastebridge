@@ -1,0 +1,97 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Linux clipboard tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pastebridge" dist/pastebridge
+          chmod 755 dist/pastebridge
+          tar -C dist -czf "pastebridge-${{ matrix.target }}.tar.gz" pastebridge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pastebridge-${{ matrix.target }}
+          path: pastebridge-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          files=(pastebridge-*.tar.gz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no binaries to publish"
+            exit 1
+          fi
+          sha256sum "${files[@]}" | tee SHA256SUMS
+      - name: Publish stable
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view stable >/dev/null 2>&1; then
+            gh release upload stable dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create stable \
+              dist/*.tar.gz dist/SHA256SUMS \
+              --target "${GITHUB_SHA}" \
+              --title "Pastebridge" \
+              --notes "Prebuilt binaries for the installer. Updated from main."
+          fi
+      - name: Publish version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

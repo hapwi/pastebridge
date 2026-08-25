@@ -2,13 +2,14 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use quinn::{Connection, Endpoint};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config::{parse_addr, Config, Paths};
 use crate::crypto::{device_id_from_cert, sas_code};
@@ -67,7 +68,10 @@ pub async fn run(
         let server = tls::pairing_server(identity)?;
         let bind = SocketAddr::from((cfg.bind_address, cfg.pair_port));
         let ep = Endpoint::server(server, bind)?;
-        let mut client_endpoint = ep.clone();
+        // Outgoing pairing uses a separate ephemeral socket. Reusing the
+        // listener port as the client source breaks QUIC through Tailscale
+        // and host firewalls.
+        let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         client_endpoint.set_default_client_config(client_cfg);
         (ep, client_endpoint)
     };
@@ -106,6 +110,13 @@ pub async fn run(
         }
         println!();
         println!("  Waiting for the other computer…  (Ctrl+C to cancel)");
+        if let Some(network) = tailscale.as_ref() {
+            println!("  If this sits here, on the other computer run:");
+            println!(
+                "      pastebridge pair --connect {}:{}",
+                network.local_ip, cfg.pair_port
+            );
+        }
         println!();
     }
 
@@ -229,6 +240,14 @@ pub async fn run(
     Ok(())
 }
 
+fn should_dial_ip(local: Ipv4Addr, peer: Ipv4Addr) -> bool {
+    local < peer
+}
+
+fn should_dial_device(our_id: &str, their_id: &str) -> bool {
+    our_id < their_id
+}
+
 async fn wait_for_peer(
     endpoint: &Endpoint,
     client_endpoint: &Endpoint,
@@ -239,7 +258,7 @@ async fn wait_for_peer(
 ) -> Result<(Connection, bool)> {
     let (tx, mut rx) = mpsc::channel::<(Connection, bool)>(8);
     let selected = Arc::new(AtomicBool::new(false));
-    let tailscale_available = tailscale.is_some();
+    let targets: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let ep = endpoint.clone();
     let tx_in = tx.clone();
@@ -262,77 +281,145 @@ async fn wait_for_peer(
         }
     });
 
+    if let Some(network) = &tailscale {
+        if let Ok(mut guard) = targets.lock() {
+            for peer_ip in &network.peer_ips {
+                if should_dial_ip(network.local_ip, *peer_ip) {
+                    guard.insert(SocketAddr::from((*peer_ip, pair_port)));
+                }
+            }
+        }
+    }
+
     if let Some(mdns) = mdns {
         if let Ok(mut browse) = discovery::browse(mdns, PAIR_SERVICE) {
             let our_id = our_id.to_string();
-            let client_endpoint = client_endpoint.clone();
-            let tx_mdns = tx.clone();
-            let mdns_selected = selected.clone();
+            let targets = targets.clone();
+            let selected = selected.clone();
             tokio::spawn(async move {
-                if tailscale_available {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    if mdns_selected.load(Ordering::Acquire) {
+                while let Some(found) = browse.recv().await {
+                    if selected.load(Ordering::Acquire) {
                         return;
                     }
-                }
-                while let Some(found) = browse.recv().await {
                     if found.device_id == our_id {
                         continue;
                     }
-                    if found.device_id < our_id {
-                        info!(
-                            "discovered {} ({}); waiting for them to connect",
-                            found.name, found.device_id
+                    if should_dial_device(&our_id, &found.device_id) {
+                        println!(
+                            "  Found {} on the LAN at {}; connecting…",
+                            found.name, found.addr
                         );
-                        continue;
-                    }
-                    info!(
-                        "discovered {} ({}) at {}; connecting",
-                        found.name, found.device_id, found.addr
-                    );
-                    match connect_to(&client_endpoint, found.addr).await {
-                        Ok(conn) => {
-                            if mdns_selected
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
-                            {
-                                let _ = tx_mdns.send((conn, true)).await;
-                                return;
-                            }
-                            conn.close(0u32.into(), b"another pairing connection was selected");
+                        if let Ok(mut guard) = targets.lock() {
+                            guard.insert(found.addr);
                         }
-                        Err(err) => warn!("connect to {} failed: {err}", found.addr),
+                    } else {
+                        println!(
+                            "  Found {} on the LAN; waiting for them to connect",
+                            found.name
+                        );
                     }
                 }
             });
         }
     }
 
-    if let Some(network) = tailscale {
-        for peer_ip in network.peer_ips {
-            if network.local_ip >= peer_ip {
-                continue;
+    let elected = targets
+        .lock()
+        .ok()
+        .is_some_and(|guard| !guard.is_empty());
+    if !elected {
+        let fallback_targets = targets.clone();
+        let fallback_selected = selected.clone();
+        let fallback_peers = tailscale.as_ref().map(|network| network.peer_ips.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            if fallback_selected.load(Ordering::Acquire) {
+                return;
             }
-            let endpoint = client_endpoint.clone();
-            let tx = tx.clone();
-            let tailscale_selected = selected.clone();
-            tokio::spawn(async move {
-                let addr = SocketAddr::from((peer_ip, pair_port));
-                let connected =
-                    tokio::time::timeout(Duration::from_secs(8), connect_to(&endpoint, addr)).await;
-                if let Ok(Ok(conn)) = connected {
-                    if tailscale_selected
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        let _ = tx.send((conn, true)).await;
-                    } else {
+            let Some(peer_ips) = fallback_peers else {
+                return;
+            };
+            if peer_ips.is_empty() {
+                return;
+            }
+            println!("  Still waiting; trying Tailscale from this side…");
+            if let Ok(mut guard) = fallback_targets.lock() {
+                for peer_ip in peer_ips {
+                    guard.insert(SocketAddr::from((peer_ip, pair_port)));
+                }
+            }
+        });
+    }
+
+    let dial_endpoint = client_endpoint.clone();
+    let dial_tx = tx.clone();
+    let dial_selected = selected.clone();
+    let dial_targets = targets.clone();
+    tokio::spawn(async move {
+        let mut announced = HashSet::new();
+        let mut reported_fail = HashSet::new();
+        loop {
+            if dial_selected.load(Ordering::Acquire) {
+                return;
+            }
+            let addrs = match dial_targets.lock() {
+                Ok(guard) => guard.iter().copied().collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            let mut attempts = tokio::task::JoinSet::new();
+            for addr in addrs {
+                if announced.insert(addr) {
+                    println!("  Trying {addr}…");
+                }
+                let endpoint = dial_endpoint.clone();
+                attempts.spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(6),
+                        connect_to(&endpoint, addr),
+                    )
+                    .await;
+                    (addr, result)
+                });
+            }
+            while let Some(joined) = attempts.join_next().await {
+                let Ok((addr, connected)) = joined else {
+                    continue;
+                };
+                if dial_selected.load(Ordering::Acquire) {
+                    if let Ok(Ok(conn)) = connected {
                         conn.close(0u32.into(), b"another pairing connection was selected");
                     }
+                    return;
                 }
-            });
+                match connected {
+                    Ok(Ok(conn)) => {
+                        if dial_selected
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            let _ = dial_tx.send((conn, true)).await;
+                            return;
+                        }
+                        conn.close(0u32.into(), b"another pairing connection was selected");
+                        return;
+                    }
+                    Ok(Err(err)) => {
+                        if reported_fail.insert(addr) {
+                            println!("  Could not reach {addr} yet; retrying…");
+                        }
+                        warn!("connect to {addr} failed: {err}");
+                    }
+                    Err(_) => {
+                        if reported_fail.insert(addr) {
+                            println!("  Could not reach {addr} yet; retrying…");
+                        }
+                        warn!("connect to {addr} timed out");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-    }
+    });
 
     tokio::time::timeout(Duration::from_secs(300), rx.recv())
         .await
@@ -384,4 +471,24 @@ fn validate_peer_name(name: &str) -> Result<()> {
         bail!("peer sent an invalid device name");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_dial_device, should_dial_ip};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn smaller_tailscale_ip_dials() {
+        let mac = Ipv4Addr::new(100, 86, 163, 95);
+        let fedora = Ipv4Addr::new(100, 118, 57, 56);
+        assert!(should_dial_ip(mac, fedora));
+        assert!(!should_dial_ip(fedora, mac));
+    }
+
+    #[test]
+    fn smaller_device_id_dials() {
+        assert!(should_dial_device("726fee597cbe41c6", "b1c67afe4a8c044f"));
+        assert!(!should_dial_device("b1c67afe4a8c044f", "726fee597cbe41c6"));
+    }
 }

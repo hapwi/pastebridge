@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.cargo/bin/pastebridge start
+ExecStart=%h/.local/bin/pastebridge start
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=pastebridge=info

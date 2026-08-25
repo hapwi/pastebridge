@@ -485,12 +485,17 @@ fn is_concealed() -> bool {
     {
         macos_concealed()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         linux_concealed()
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_concealed() -> bool {
     let command = if is_wayland() && has_cmd("wl-paste") {
         let mut command = Command::new("wl-paste");
@@ -529,12 +534,10 @@ mod macos_nspasteboard {
 
     pub fn is_concealed() -> bool {
         let marker = ns_string!("org.nspasteboard.ConcealedType");
-        unsafe {
-            let pb = NSPasteboard::generalPasteboard();
-            match pb.types() {
-                Some(types) => types.containsObject(marker),
-                None => false,
-            }
+        let pb = NSPasteboard::generalPasteboard();
+        match pb.types() {
+            Some(types) => types.containsObject(marker),
+            None => false,
         }
     }
 }
