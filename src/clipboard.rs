@@ -5,9 +5,10 @@ use std::borrow::Cow;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::config::MAX_PAYLOAD_BYTES;
 use crate::crypto::clip_hash;
@@ -32,6 +33,8 @@ pub struct Clipboard {
     inner: Option<Arboard>,
     last_hash: Option<String>,
     ignore_hash: Option<String>,
+    file_identity: Option<String>,
+    file_clip: Option<Clip>,
     pub backend: String,
 }
 
@@ -43,6 +46,8 @@ impl Clipboard {
             inner,
             last_hash: None,
             ignore_hash: None,
+            file_identity: None,
+            file_clip: None,
             backend,
         })
     }
@@ -65,6 +70,7 @@ impl Clipboard {
     }
 
     pub fn set(&mut self, clip: &Clip) -> Result<()> {
+        self.clear_file_cache();
         self.ignore_hash = Some(clip.hash());
         self.last_hash = self.ignore_hash.clone();
         match clip.mime.as_str() {
@@ -90,16 +96,17 @@ impl Clipboard {
 
     pub fn read(&mut self) -> Option<Clip> {
         let concealed = is_concealed();
-        if let Some(text) = self.read_text() {
-            let text = text.trim_end_matches('\0').to_string();
-            if !text.is_empty() {
-                return Some(Clip {
-                    mime: "text/plain".into(),
-                    bytes: text.into_bytes(),
-                    concealed,
-                });
-            }
+
+        // A photo file from Finder/Nautilus is a file URI; send it as pixels.
+        // Other files (PDFs, zips) are not synced. Screenshots and browser
+        // "Copy Image" have no file URI and are handled as pixels below.
+        if let Some(paths) = self.read_local_file_paths() {
+            return self.image_clip_from_paths(paths, concealed);
         }
+        self.clear_file_cache();
+
+        // Copy image / screenshot / "Copy Image" in a browser: pixels beat
+        // companion HTML and URL metadata.
         if let Some(png) = self.read_image_png() {
             if !png.is_empty() {
                 return Some(Clip {
@@ -109,6 +116,18 @@ impl Clipboard {
                 });
             }
         }
+
+        if let Some(text) = self.read_text() {
+            let text = normalize_clipboard_text(&text);
+            if !text.is_empty() {
+                return Some(Clip {
+                    mime: "text/plain".into(),
+                    bytes: text.into_bytes(),
+                    concealed,
+                });
+            }
+        }
+
         None
     }
 
@@ -133,6 +152,10 @@ impl Clipboard {
         if let Some(png) = wl_paste_image().or_else(xclip_paste_image) {
             return Some(png);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(png) = macos_nspasteboard::read_image_png() {
+            return Some(png);
+        }
         if let Some(cb) = self.inner.as_mut() {
             if let Ok(img) = cb.get_image() {
                 if validate_image_size(img.width, img.height).is_err() {
@@ -144,6 +167,43 @@ impl Clipboard {
             }
         }
         None
+    }
+
+    fn image_clip_from_paths(&mut self, paths: Vec<PathBuf>, concealed: bool) -> Option<Clip> {
+        let identity = file_identity(&paths)?;
+        if self.file_identity.as_deref() == Some(&identity) {
+            return self.file_clip.clone();
+        }
+        let png = png_from_single_image_file(&paths)?;
+        let clip = Clip {
+            mime: "image/png".into(),
+            bytes: png,
+            concealed,
+        };
+        self.file_identity = Some(identity);
+        self.file_clip = Some(clip.clone());
+        Some(clip)
+    }
+
+    fn read_local_file_paths(&mut self) -> Option<Vec<PathBuf>> {
+        if let Some(paths) = wl_paste_file_paths().or_else(xclip_paste_file_paths) {
+            if !paths.is_empty() {
+                return Some(paths);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let paths = macos_nspasteboard::read_file_paths();
+            if !paths.is_empty() {
+                return Some(paths);
+            }
+        }
+        None
+    }
+
+    fn clear_file_cache(&mut self) {
+        self.file_identity = None;
+        self.file_clip = None;
     }
 
     fn set_text(&mut self, text: &str) -> Result<()> {
@@ -185,6 +245,13 @@ impl Clipboard {
         if wl_copy_image(png).is_ok() {
             ok = true;
         }
+        if xclip_copy_image(png).is_ok() {
+            ok = true;
+        }
+        #[cfg(target_os = "macos")]
+        if macos_nspasteboard::write_image_png(png).is_ok() {
+            ok = true;
+        }
         if ok {
             Ok(())
         } else {
@@ -218,6 +285,175 @@ impl Clipboard {
 
 fn same_content(left: &Clip, right: &Clip) -> bool {
     left.mime == right.mime && left.bytes == right.bytes
+}
+
+fn normalize_clipboard_text(text: &str) -> String {
+    text.trim_end_matches('\0').to_string()
+}
+
+fn decode_clipboard_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) && bytes.len() >= 4 && bytes.len() % 2 == 0 {
+        if let Ok(text) = decode_utf16_le(&bytes[2..]) {
+            return Some(text);
+        }
+    }
+    if looks_like_utf16_le(bytes) {
+        if let Ok(text) = decode_utf16_le(bytes) {
+            return Some(text);
+        }
+    }
+    std::str::from_utf8(bytes).ok().map(ToString::to_string)
+}
+
+fn looks_like_utf16_le(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && bytes.len() % 2 == 0
+        && bytes
+            .chunks_exact(2)
+            .take(8)
+            .all(|chunk| chunk[1] == 0 && chunk[0] != 0)
+}
+
+fn decode_utf16_le(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+}
+
+fn file_identity(paths: &[PathBuf]) -> Option<String> {
+    if paths.len() != 1 {
+        return None;
+    }
+    let path = &paths[0];
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}:{}:{modified}", path.display(), metadata.len()))
+}
+
+fn png_from_single_image_file(paths: &[PathBuf]) -> Option<Vec<u8>> {
+    if paths.len() != 1 {
+        return None;
+    }
+    let path = paths[0].canonicalize().unwrap_or_else(|_| paths[0].clone());
+    if !is_image_path(&path) {
+        return None;
+    }
+    let data = std::fs::read(&path).ok()?;
+    let name = path.file_name()?.to_str()?;
+    image_file_to_png(name, &data)
+}
+
+fn image_file_to_png(name: &str, data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() || data.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    if let Some(png) = bytes_to_png(data) {
+        return Some(png);
+    }
+    if is_png_name(name) && png_to_rgba(data).is_ok() {
+        return Some(data.to_vec());
+    }
+    None
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_image_name)
+}
+
+fn is_image_name(name: &str) -> bool {
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
+}
+
+fn is_png_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+}
+
+fn parse_uri_list(raw: &str) -> Vec<PathBuf> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(file_uri_to_path)
+        .collect()
+}
+
+fn parse_gnome_copied_files(raw: &str) -> Vec<PathBuf> {
+    let mut lines = raw.lines().map(str::trim).filter(|line| !line.is_empty());
+    let action = lines.next().unwrap_or("copy");
+    if action != "copy" && action != "cut" {
+        return Vec::new();
+    }
+    lines.filter_map(file_uri_to_path).collect()
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let uri = uri.trim();
+    let path = uri.strip_prefix("file://")?;
+    let path = if cfg!(windows) {
+        path.strip_prefix('/').unwrap_or(path)
+    } else {
+        path
+    };
+    let path = percent_decode(path)?;
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn bytes_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    validate_image_size(w, h).ok()?;
+    rgba_to_png(w, h, &img.into_rgba8().into_raw()).ok()
 }
 
 fn detect_backend(arboard: bool) -> String {
@@ -288,19 +524,70 @@ fn wl_paste_text() -> Option<String> {
     if !is_wayland() || !has_cmd("wl-paste") {
         return None;
     }
-    let mut command = Command::new("wl-paste");
-    command.args(["-t", "text", "--no-newline"]);
-    String::from_utf8(read_command_output(command, MAX_PAYLOAD_BYTES)?).ok()
+    for mime in [
+        "text/plain",
+        "text/plain;charset=utf-8",
+        "TEXT",
+        "STRING",
+        "UTF8_STRING",
+    ] {
+        let mut command = Command::new("wl-paste");
+        command.args(["-t", mime, "--no-newline"]);
+        if let Some(bytes) = read_command_output(command, MAX_PAYLOAD_BYTES) {
+            if let Some(text) = decode_clipboard_bytes(&bytes) {
+                let text = normalize_clipboard_text(&text);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn wl_paste_image() -> Option<Vec<u8>> {
     if !is_wayland() || !has_cmd("wl-paste") {
         return None;
     }
+    for mime in ["image/png", "image/bmp", "image/webp"] {
+        let mut command = Command::new("wl-paste");
+        command.args(["-t", mime]);
+        let Some(output) = read_command_output(command, MAX_PAYLOAD_BYTES) else {
+            continue;
+        };
+        if output.is_empty() {
+            continue;
+        }
+        if mime == "image/png" {
+            return Some(output);
+        }
+        if let Some(png) = bytes_to_png(&output) {
+            return Some(png);
+        }
+    }
+    None
+}
+
+fn wl_paste_file_paths() -> Option<Vec<PathBuf>> {
+    if !is_wayland() || !has_cmd("wl-paste") {
+        return None;
+    }
     let mut command = Command::new("wl-paste");
-    command.args(["-t", "image/png"]);
-    let output = read_command_output(command, MAX_PAYLOAD_BYTES)?;
-    (!output.is_empty()).then_some(output)
+    command.args(["-t", "x-special/gnome-copied-files"]);
+    if let Some(output) = read_command_output(command, 64 * 1024) {
+        if let Some(text) = decode_clipboard_bytes(&output) {
+            let paths = parse_gnome_copied_files(&text);
+            if !paths.is_empty() {
+                return Some(paths);
+            }
+        }
+    }
+    let mut command = Command::new("wl-paste");
+    command.args(["-t", "text/uri-list"]);
+    let output = read_command_output(command, 64 * 1024)?;
+    let text = decode_clipboard_bytes(&output)?;
+    let paths = parse_uri_list(&text);
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn wl_copy_text(text: &str) -> Result<()> {
@@ -367,17 +654,43 @@ fn xclip_paste_text() -> Option<String> {
     }
     let mut command = Command::new("xclip");
     command.args(["-selection", "clipboard", "-o"]);
-    String::from_utf8(read_command_output(command, MAX_PAYLOAD_BYTES)?).ok()
+    let bytes = read_command_output(command, MAX_PAYLOAD_BYTES)?;
+    decode_clipboard_bytes(&bytes).map(|text| normalize_clipboard_text(&text))
 }
 
 fn xclip_paste_image() -> Option<Vec<u8>> {
     if is_wayland() || !has_cmd("xclip") {
         return None;
     }
+    for mime in ["image/png", "image/bmp", "image/webp"] {
+        let mut command = Command::new("xclip");
+        command.args(["-selection", "clipboard", "-t", mime, "-o"]);
+        let Some(output) = read_command_output(command, MAX_PAYLOAD_BYTES) else {
+            continue;
+        };
+        if output.is_empty() {
+            continue;
+        }
+        if mime == "image/png" {
+            return Some(output);
+        }
+        if let Some(png) = bytes_to_png(&output) {
+            return Some(png);
+        }
+    }
+    None
+}
+
+fn xclip_paste_file_paths() -> Option<Vec<PathBuf>> {
+    if is_wayland() || !has_cmd("xclip") {
+        return None;
+    }
     let mut command = Command::new("xclip");
-    command.args(["-selection", "clipboard", "-t", "image/png", "-o"]);
-    let output = read_command_output(command, MAX_PAYLOAD_BYTES)?;
-    (!output.is_empty()).then_some(output)
+    command.args(["-selection", "clipboard", "-t", "text/uri-list", "-o"]);
+    let output = read_command_output(command, 64 * 1024)?;
+    let text = decode_clipboard_bytes(&output)?;
+    let paths = parse_uri_list(&text);
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn xclip_copy_text(text: &str) -> Result<()> {
@@ -398,6 +711,27 @@ fn xclip_copy_text(text: &str) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("xclip failed")
+    }
+}
+
+fn xclip_copy_image(png: &[u8]) -> Result<()> {
+    if is_wayland() || !has_cmd("xclip") {
+        anyhow::bail!("no xclip");
+    }
+    let mut child = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(png)?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("xclip image failed")
     }
 }
 
@@ -529,8 +863,9 @@ fn macos_concealed() -> bool {
 
 #[cfg(target_os = "macos")]
 mod macos_nspasteboard {
+    use anyhow::Result;
     use objc2_app_kit::NSPasteboard;
-    use objc2_foundation::ns_string;
+    use objc2_foundation::{ns_string, NSArray, NSData, NSString};
 
     pub fn is_concealed() -> bool {
         let marker = ns_string!("org.nspasteboard.ConcealedType");
@@ -540,11 +875,76 @@ mod macos_nspasteboard {
             None => false,
         }
     }
+
+    pub fn read_image_png() -> Option<Vec<u8>> {
+        let pb = NSPasteboard::generalPasteboard();
+        for mime in [
+            "public.png",
+            "Apple PNG pasteboard type",
+            "public.tiff",
+            "public.jpeg",
+        ] {
+            let ty = NSString::from_str(mime);
+            let Some(data) = pb.dataForType(&ty) else {
+                continue;
+            };
+            let bytes = data.to_vec();
+            if bytes.is_empty() {
+                continue;
+            }
+            if mime.contains("png") {
+                return Some(bytes);
+            }
+            if let Some(png) = super::bytes_to_png(&bytes) {
+                return Some(png);
+            }
+        }
+        None
+    }
+
+    pub fn write_image_png(png: &[u8]) -> Result<()> {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let data = NSData::with_bytes(png);
+        if pb.setData_forType(Some(&data), ns_string!("public.png")) {
+            Ok(())
+        } else {
+            anyhow::bail!("could not write image to NSPasteboard")
+        }
+    }
+
+    pub fn read_file_paths() -> Vec<std::path::PathBuf> {
+        let pb = NSPasteboard::generalPasteboard();
+        if let Some(list) = pb.propertyListForType(ns_string!("NSFilenamesPboardType")) {
+            let mut paths = Vec::new();
+            if let Some(array) = list.downcast_ref::<NSArray>() {
+                for elem in array {
+                    if let Some(item) = elem.downcast_ref::<NSString>() {
+                        paths.push(std::path::PathBuf::from(item.to_string()));
+                    }
+                }
+            }
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+        if let Some(url) = pb.stringForType(ns_string!("public.file-url")) {
+            if let Some(path) = super::file_uri_to_path(&url.to_string()) {
+                return vec![path];
+            }
+        }
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{same_content, Clip};
+    use super::{
+        decode_clipboard_bytes, file_uri_to_path, is_image_name, parse_gnome_copied_files,
+        parse_uri_list, png_from_single_image_file, same_content, Clip,
+    };
+    use image::{ImageBuffer, ImageFormat, RgbaImage};
+    use std::io::Cursor;
 
     fn clip(mime: &str, bytes: &[u8]) -> Clip {
         Clip {
@@ -567,5 +967,58 @@ mod tests {
         let expected = clip("image/png", &[1, 2, 3, 4]);
         assert!(same_content(&expected, &clip("image/png", &[1, 2, 3, 4])));
         assert!(!same_content(&expected, &clip("image/png", &[1, 2, 3, 5])));
+    }
+
+    #[test]
+    fn parses_uri_lists_and_gnome_file_payloads() {
+        let paths = parse_uri_list("file:///tmp/a.png\n#comment\n");
+        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/a.png")]);
+        let paths = parse_gnome_copied_files("copy\nfile:///tmp/a.png\nfile:///tmp/b.txt\n");
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("/tmp/a.png"),
+                std::path::PathBuf::from("/tmp/b.txt"),
+            ]
+        );
+        assert_eq!(
+            file_uri_to_path("file:///home/user/My%20Photo.png"),
+            Some(std::path::PathBuf::from("/home/user/My Photo.png"))
+        );
+        assert_eq!(
+            file_uri_to_path("file:///home/user/Caf%C3%A9.png"),
+            Some(std::path::PathBuf::from("/home/user/Café.png"))
+        );
+    }
+
+    #[test]
+    fn decodes_utf16_clipboard_text() {
+        let utf16 = "hi"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(decode_clipboard_bytes(&utf16), Some("hi".into()));
+    }
+
+    #[test]
+    fn single_image_file_becomes_png_pixels() {
+        assert!(is_image_name("vacation.jpg"));
+        assert!(is_image_name("shot.PNG"));
+        assert!(!is_image_name("notes.pdf"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        let img: RgbaImage = ImageBuffer::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Png).unwrap();
+        std::fs::write(&path, out.into_inner()).unwrap();
+
+        let decoded = png_from_single_image_file(&[path.clone()]).unwrap();
+        assert!(!decoded.is_empty());
+        assert!(png_from_single_image_file(&[path.clone(), path]).is_none());
+
+        let pdf = dir.path().join("notes.pdf");
+        std::fs::write(&pdf, b"%PDF").unwrap();
+        assert!(png_from_single_image_file(&[pdf]).is_none());
     }
 }
