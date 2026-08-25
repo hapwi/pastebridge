@@ -95,10 +95,8 @@ pub fn run(yes: bool, paths: &Paths) -> Result<()> {
         bail!("archive did not contain pastebridge");
     }
 
-    replace_binary(&extracted)?;
-    if let Err(err) =
-        crate::macos_identity::prepare_executable(&std::env::current_exe()?.canonicalize()?)
-    {
+    let dest = replace_binary(&extracted)?;
+    if let Err(err) = crate::macos_identity::prepare_executable(&dest) {
         tracing::warn!("could not clear macOS quarantine after update: {err}");
     }
     if crate::daemon::running_pid(paths).is_some() {
@@ -144,7 +142,10 @@ fn rustc_target() -> Result<&'static str> {
     }
 }
 
-fn replace_binary(new_bin: &Path) -> Result<()> {
+fn replace_binary(new_bin: &Path) -> Result<PathBuf> {
+    // Resolve the destination *before* overwriting. After replace, Linux
+    // `/proc/self/exe` points at a deleted inode, so `current_exe()` /
+    // `canonicalize()` fail even though the new binary is already in place.
     let dest = std::env::current_exe()
         .context("could not locate this pastebridge binary")?
         .canonicalize()
@@ -162,7 +163,7 @@ fn replace_binary(new_bin: &Path) -> Result<()> {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     }
     fs::rename(&tmp, &dest).with_context(|| format!("replacing {}", dest.display()))?;
-    Ok(())
+    Ok(dest)
 }
 
 fn curl_get(url: &str) -> Result<Vec<u8>> {

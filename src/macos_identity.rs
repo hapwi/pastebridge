@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg(target_os = "macos")]
 #[used]
@@ -20,9 +20,13 @@ pub fn prepare_executable(binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = &INFO_PLIST;
+        // Missing quarantine is normal for a previously-installed binary.
+        // xattr prints to stderr in that case; swallow it.
         let _ = Command::new("xattr")
             .args(["-d", "com.apple.quarantine"])
             .arg(binary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         Ok(())
     }

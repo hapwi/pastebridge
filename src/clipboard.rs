@@ -15,6 +15,15 @@ use crate::crypto::clip_hash;
 
 const MAX_IMAGE_DIMENSION: usize = 8192;
 const MAX_IMAGE_DECODED_BYTES: usize = 64 * 1024 * 1024;
+const IMAGE_PASTE_MIMES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+];
 
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -98,10 +107,12 @@ impl Clipboard {
         let concealed = is_concealed();
 
         // A photo file from Finder/Nautilus is a file URI; send it as pixels.
-        // Other files (PDFs, zips) are not synced. Screenshots and browser
-        // "Copy Image" have no file URI and are handled as pixels below.
+        // Other files (PDFs, zips) are not synced — fall through so a browser
+        // "Copy Image" that also offers a file URI / URL can still send pixels.
         if let Some(paths) = self.read_local_file_paths() {
-            return self.image_clip_from_paths(paths, concealed);
+            if let Some(clip) = self.image_clip_from_paths(paths, concealed) {
+                return Some(clip);
+            }
         }
         self.clear_file_cache();
 
@@ -549,7 +560,7 @@ fn wl_paste_image() -> Option<Vec<u8>> {
     if !is_wayland() || !has_cmd("wl-paste") {
         return None;
     }
-    for mime in ["image/png", "image/bmp", "image/webp"] {
+    for mime in IMAGE_PASTE_MIMES {
         let mut command = Command::new("wl-paste");
         command.args(["-t", mime]);
         let Some(output) = read_command_output(command, MAX_PAYLOAD_BYTES) else {
@@ -558,8 +569,10 @@ fn wl_paste_image() -> Option<Vec<u8>> {
         if output.is_empty() {
             continue;
         }
-        if mime == "image/png" {
-            return Some(output);
+        if *mime == "image/png" {
+            if png_to_rgba(&output).is_ok() {
+                return Some(output);
+            }
         }
         if let Some(png) = bytes_to_png(&output) {
             return Some(png);
@@ -662,7 +675,7 @@ fn xclip_paste_image() -> Option<Vec<u8>> {
     if is_wayland() || !has_cmd("xclip") {
         return None;
     }
-    for mime in ["image/png", "image/bmp", "image/webp"] {
+    for mime in IMAGE_PASTE_MIMES {
         let mut command = Command::new("xclip");
         command.args(["-selection", "clipboard", "-t", mime, "-o"]);
         let Some(output) = read_command_output(command, MAX_PAYLOAD_BYTES) else {
@@ -671,8 +684,10 @@ fn xclip_paste_image() -> Option<Vec<u8>> {
         if output.is_empty() {
             continue;
         }
-        if mime == "image/png" {
-            return Some(output);
+        if *mime == "image/png" {
+            if png_to_rgba(&output).is_ok() {
+                return Some(output);
+            }
         }
         if let Some(png) = bytes_to_png(&output) {
             return Some(png);
