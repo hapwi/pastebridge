@@ -1,9 +1,10 @@
 use anyhow::Result;
-use std::net::TcpListener;
+use std::net::UdpSocket;
 
 use crate::clipboard::Clipboard;
 use crate::config::Paths;
 use crate::daemon;
+use crate::discovery;
 use crate::identity::{Identity, PeerList};
 use crate::Config;
 
@@ -45,9 +46,9 @@ pub fn run(cfg: &Config, paths: &Paths, identity: &Identity) -> Result<()> {
         }
     }
 
-    let port_ok = TcpListener::bind(("0.0.0.0", cfg.port)).is_ok();
+    let port_ok = UdpSocket::bind(("0.0.0.0", cfg.port)).is_ok();
     check(
-        &format!("udp/tcp port {} free for setup", cfg.port),
+        &format!("UDP port {} free for setup", cfg.port),
         port_ok || daemon::running_pid(paths).is_some(),
         &mut failed,
     );
@@ -65,6 +66,24 @@ pub fn run(cfg: &Config, paths: &Paths, identity: &Identity) -> Result<()> {
             println!("  If paste from the other computer is unreliable,");
             println!("  install wl-clipboard and keep a terminal session logged in.");
         }
+    }
+
+    match discovery::tailscale_network() {
+        Ok(Some(network)) => {
+            check("Tailscale (automatic)", true, &mut failed);
+            println!(
+                "  local {} — {} online peer address{}",
+                network.local_ip,
+                network.peer_ips.len(),
+                if network.peer_ips.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            );
+        }
+        Ok(None) => println!("[--]  Tailscale not installed (LAN discovery remains enabled)"),
+        Err(err) => println!("[--]  Tailscale unavailable ({err}); LAN discovery remains enabled"),
     }
 
     if let Some(pid) = daemon::running_pid(paths) {

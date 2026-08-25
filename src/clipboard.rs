@@ -1,12 +1,19 @@
 use anyhow::{Context, Result};
 use arboard::{Clipboard as Arboard, ImageData};
-use image::{ImageBuffer, ImageFormat, RgbaImage};
+use image::{ImageBuffer, ImageFormat, ImageReader, RgbaImage};
 use std::borrow::Cow;
 use std::io::Cursor;
+use std::io::Read;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use crate::config::MAX_PAYLOAD_BYTES;
 use crate::crypto::clip_hash;
+
+const MAX_IMAGE_DIMENSION: usize = 8192;
+const MAX_IMAGE_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -66,6 +73,21 @@ impl Clipboard {
         }
     }
 
+    /// Clears the clipboard only when its current supported content is exactly `expected`.
+    ///
+    /// Clipboard protocols do not provide a portable compare-and-clear operation, so this
+    /// performs the comparison immediately before the backend clear.
+    pub fn clear_if_matches(&mut self, expected: &Clip) -> Result<bool> {
+        let Some(current) = self.read() else {
+            return Ok(false);
+        };
+        if !same_content(&current, expected) {
+            return Ok(false);
+        }
+        self.clear()?;
+        Ok(true)
+    }
+
     pub fn read(&mut self) -> Option<Clip> {
         let concealed = is_concealed();
         if let Some(text) = self.read_text() {
@@ -91,6 +113,12 @@ impl Clipboard {
     }
 
     fn read_text(&mut self) -> Option<String> {
+        if let Some(text) = wl_paste_text()
+            .or_else(xclip_paste_text)
+            .or_else(pb_paste_text)
+        {
+            return Some(text);
+        }
         if let Some(cb) = self.inner.as_mut() {
             if let Ok(text) = cb.get_text() {
                 if !text.is_empty() {
@@ -98,20 +126,24 @@ impl Clipboard {
                 }
             }
         }
-        wl_paste_text()
-            .or_else(xclip_paste_text)
-            .or_else(pb_paste_text)
+        None
     }
 
     fn read_image_png(&mut self) -> Option<Vec<u8>> {
+        if let Some(png) = wl_paste_image().or_else(xclip_paste_image) {
+            return Some(png);
+        }
         if let Some(cb) = self.inner.as_mut() {
             if let Ok(img) = cb.get_image() {
+                if validate_image_size(img.width, img.height).is_err() {
+                    return None;
+                }
                 if let Ok(png) = rgba_to_png(img.width, img.height, &img.bytes) {
                     return Some(png);
                 }
             }
         }
-        wl_paste_image().or_else(xclip_paste_image)
+        None
     }
 
     fn set_text(&mut self, text: &str) -> Result<()> {
@@ -159,6 +191,33 @@ impl Clipboard {
             anyhow::bail!("could not write clipboard image")
         }
     }
+
+    fn clear(&mut self) -> Result<()> {
+        let mut ok = false;
+        if let Some(cb) = self.inner.as_mut() {
+            if cb.clear().is_ok() {
+                ok = true;
+            }
+        }
+        if wl_clear().is_ok() {
+            ok = true;
+        }
+        if xclip_clear().is_ok() {
+            ok = true;
+        }
+        if pb_clear().is_ok() {
+            ok = true;
+        }
+        if ok {
+            Ok(())
+        } else {
+            anyhow::bail!("could not clear clipboard")
+        }
+    }
+}
+
+fn same_content(left: &Clip, right: &Clip) -> bool {
+    left.mime == right.mime && left.bytes == right.bytes
 }
 
 fn detect_backend(arboard: bool) -> String {
@@ -192,6 +251,7 @@ fn is_wayland() -> bool {
 }
 
 fn rgba_to_png(width: usize, height: usize, bytes: &[u8]) -> Result<Vec<u8>> {
+    validate_image_size(width, height)?;
     let img: RgbaImage = ImageBuffer::from_raw(width as u32, height as u32, bytes.to_vec())
         .context("invalid rgba buffer")?;
     let mut out = Cursor::new(Vec::new());
@@ -200,38 +260,47 @@ fn rgba_to_png(width: usize, height: usize, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn png_to_rgba(png: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
+    let (width, height) =
+        ImageReader::with_format(Cursor::new(png), ImageFormat::Png).into_dimensions()?;
+    validate_image_size(width as usize, height as usize)?;
     let img = image::load_from_memory(png)?.into_rgba8();
     let w = img.width() as usize;
     let h = img.height() as usize;
+    validate_image_size(w, h)?;
     Ok((w, h, img.into_raw()))
+}
+
+fn validate_image_size(width: usize, height: usize) -> Result<()> {
+    let decoded_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("image dimensions overflow")?;
+    if width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || decoded_bytes > MAX_IMAGE_DECODED_BYTES
+    {
+        anyhow::bail!("image dimensions exceed the safe clipboard limit");
+    }
+    Ok(())
 }
 
 fn wl_paste_text() -> Option<String> {
     if !is_wayland() || !has_cmd("wl-paste") {
         return None;
     }
-    let out = Command::new("wl-paste")
-        .args(["-t", "text", "--no-newline"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+    let mut command = Command::new("wl-paste");
+    command.args(["-t", "text", "--no-newline"]);
+    String::from_utf8(read_command_output(command, MAX_PAYLOAD_BYTES)?).ok()
 }
 
 fn wl_paste_image() -> Option<Vec<u8>> {
     if !is_wayland() || !has_cmd("wl-paste") {
         return None;
     }
-    let out = Command::new("wl-paste")
-        .args(["-t", "image/png"])
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return None;
-    }
-    Some(out.stdout)
+    let mut command = Command::new("wl-paste");
+    command.args(["-t", "image/png"]);
+    let output = read_command_output(command, MAX_PAYLOAD_BYTES)?;
+    (!output.is_empty()).then_some(output)
 }
 
 fn wl_copy_text(text: &str) -> Result<()> {
@@ -275,32 +344,40 @@ fn wl_copy_image(png: &[u8]) -> Result<()> {
     }
 }
 
+fn wl_clear() -> Result<()> {
+    if !is_wayland() || !has_cmd("wl-copy") {
+        anyhow::bail!("no wl-copy");
+    }
+    let status = Command::new("wl-copy")
+        .arg("--clear")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("wl-copy clear failed")
+    }
+}
+
 fn xclip_paste_text() -> Option<String> {
     if is_wayland() || !has_cmd("xclip") {
         return None;
     }
-    let out = Command::new("xclip")
-        .args(["-selection", "clipboard", "-o"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+    let mut command = Command::new("xclip");
+    command.args(["-selection", "clipboard", "-o"]);
+    String::from_utf8(read_command_output(command, MAX_PAYLOAD_BYTES)?).ok()
 }
 
 fn xclip_paste_image() -> Option<Vec<u8>> {
     if is_wayland() || !has_cmd("xclip") {
         return None;
     }
-    let out = Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return None;
-    }
-    Some(out.stdout)
+    let mut command = Command::new("xclip");
+    command.args(["-selection", "clipboard", "-t", "image/png", "-o"]);
+    let output = read_command_output(command, MAX_PAYLOAD_BYTES)?;
+    (!output.is_empty()).then_some(output)
 }
 
 fn xclip_copy_text(text: &str) -> Result<()> {
@@ -324,15 +401,19 @@ fn xclip_copy_text(text: &str) -> Result<()> {
     }
 }
 
+fn xclip_clear() -> Result<()> {
+    if is_wayland() || !has_cmd("xclip") {
+        anyhow::bail!("no xclip");
+    }
+    xclip_copy_text("")
+}
+
 fn pb_paste_text() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let out = Command::new("pbpaste").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+    let command = Command::new("pbpaste");
+    String::from_utf8(read_command_output(command, MAX_PAYLOAD_BYTES)?).ok()
 }
 
 fn pb_copy_text(text: &str) -> Result<()> {
@@ -355,6 +436,50 @@ fn pb_copy_text(text: &str) -> Result<()> {
     }
 }
 
+fn pb_clear() -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("not macos");
+    }
+    pb_copy_text("")
+}
+
+fn read_command_output(mut command: Command, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .by_ref()
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut output);
+        (result, output)
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().ok()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let (read_result, output) = reader.join().ok()?;
+    read_result.ok()?;
+    if output.len() > max_bytes {
+        return None;
+    }
+    status.success().then_some(output)
+}
+
 fn is_concealed() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -367,16 +492,28 @@ fn is_concealed() -> bool {
 }
 
 fn linux_concealed() -> bool {
-    if !has_cmd("wl-paste") {
-        return false;
-    }
-    let Ok(out) = Command::new("wl-paste").arg("--list-types").output() else {
-        return false;
+    let command = if is_wayland() && has_cmd("wl-paste") {
+        let mut command = Command::new("wl-paste");
+        command.arg("--list-types");
+        command
+    } else if !is_wayland() && has_cmd("xclip") {
+        let mut command = Command::new("xclip");
+        command.args(["-selection", "clipboard", "-t", "TARGETS", "-o"]);
+        command
+    } else {
+        // If the active Linux backend cannot expose clipboard metadata, do not
+        // risk forwarding password-manager contents.
+        return true;
     };
-    let types = String::from_utf8_lossy(&out.stdout);
+    let Some(output) = read_command_output(command, 64 * 1024) else {
+        return true;
+    };
+    let types = String::from_utf8_lossy(&output);
     types.lines().any(|t| {
         let t = t.to_ascii_lowercase();
-        t.contains("passwordmanagerhint") || t.contains("concealed")
+        t.contains("passwordmanagerhint")
+            || t.contains("x-kde-passwordmanagerhint")
+            || t.contains("concealed")
     })
 }
 
@@ -399,5 +536,33 @@ mod macos_nspasteboard {
                 None => false,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{same_content, Clip};
+
+    fn clip(mime: &str, bytes: &[u8]) -> Clip {
+        Clip {
+            mime: mime.into(),
+            bytes: bytes.to_vec(),
+            concealed: false,
+        }
+    }
+
+    #[test]
+    fn expiry_match_requires_exact_text_content() {
+        let expected = clip("text/plain", b"remote text");
+        assert!(same_content(&expected, &clip("text/plain", b"remote text")));
+        assert!(!same_content(&expected, &clip("text/plain", b"user edit")));
+        assert!(!same_content(&expected, &clip("image/png", b"remote text")));
+    }
+
+    #[test]
+    fn expiry_match_requires_exact_image_bytes() {
+        let expected = clip("image/png", &[1, 2, 3, 4]);
+        assert!(same_content(&expected, &clip("image/png", &[1, 2, 3, 4])));
+        assert!(!same_content(&expected, &clip("image/png", &[1, 2, 3, 5])));
     }
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Install Pastebridge without cloning:
-#   curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
+# Download, inspect, and install Pastebridge:
+#   curl -fsSLo /tmp/pastebridge-install.sh https://hapwi.github.io/install/pastebridge.sh
+#   less /tmp/pastebridge-install.sh
+#   bash /tmp/pastebridge-install.sh
 set -euo pipefail
 
 REPO_HTTPS="https://github.com/hapwi/pastebridge"
@@ -70,7 +72,7 @@ ensure_macos_devtools() {
   fi
   fail "Xcode Command Line Tools are required. Run: xcode-select --install
 Then re-run:
-  curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash"
+  bash /tmp/pastebridge-install.sh"
 }
 
 ensure_linux_build() {
@@ -105,20 +107,7 @@ ensure_rust() {
   if need_cmd rustc && need_cmd cargo; then
     return
   fi
-  say "Installing Rust (rustup)…"
-  if ! need_cmd curl; then
-    fail "curl is required to install Rust"
-  fi
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-  load_cargo_env
-  if [[ "$(os_name)" == Darwin ]]; then
-    ensure_path_file "$HOME/.zprofile"
-    ensure_path_file "$HOME/.zshrc"
-  else
-    ensure_path_file "$HOME/.bashrc"
-    ensure_path_file "$HOME/.profile"
-  fi
-  need_cmd cargo || fail "Rust installed, but cargo is not on PATH. Open a new terminal and re-run."
+  fail "Rust and Cargo are required. Install Rust from https://rustup.rs, inspect its instructions, then re-run this installer."
 }
 
 maybe_wl_clipboard() {
@@ -195,19 +184,18 @@ main() {
 
   say
   say "Installed: $bin"
+  if ! "$bin" install-service; then
+    say "The login service could not be enabled automatically."
+    say "Run this after resolving the reported issue: pastebridge install-service"
+  fi
   "$bin" doctor || true
   say
-  if "$bin" install-service; then
-    say
-  else
-    say "Start it later with:  pastebridge install-service"
-    say
-  fi
   say "Next, pair this computer with the other one:"
   say "  pastebridge pair"
   say
   say "On the other computer run the same installer, then pastebridge pair."
   say "Compare the 8-digit codes. If they match, type y on both."
+  say "The login service is already enabled; syncing starts after pairing."
   say
   if [[ "$(os_name)" == Darwin ]]; then
     say "If macOS asks for clipboard or network permission, allow it."

@@ -64,6 +64,10 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
          Restart=on-failure\n\
          RestartSec=3\n\
          Environment=RUST_LOG=pastebridge=info\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         RestrictSUIDSGID=true\n\
+         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -82,9 +86,6 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     if enable.success() {
         println!("Enabled user service `pastebridge.service`.");
         println!("It will start whenever you log in.");
-        let _ = Command::new("loginctl")
-            .args(["enable-linger", &std::env::var("USER").unwrap_or_default()])
-            .status();
     } else {
         println!("Could not enable via systemctl. Start it yourself with:");
         println!("  systemctl --user enable --now pastebridge.service");

@@ -1,6 +1,7 @@
-//! Two processes pair over localhost using --yes and --connect.
+//! Two processes pair interactively over localhost using --connect.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -29,22 +30,39 @@ fn pair_over_localhost() {
     .unwrap();
 
     let mut server = Command::new(bin())
-        .args(["pair", "--yes"])
+        .arg("pair")
         .env("PASTEBRIDGE_HOME", &home_a)
         .env("RUST_LOG", "warn")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn server");
+    server
+        .stdin
+        .take()
+        .expect("server stdin")
+        .write_all(b"y\n")
+        .expect("confirm server pairing");
 
     thread::sleep(Duration::from_millis(400));
 
-    let client = Command::new(bin())
-        .args(["pair", "--yes", "--connect", "127.0.0.1:27421"])
+    let mut client = Command::new(bin())
+        .args(["pair", "--connect", "127.0.0.1:27421"])
         .env("PASTEBRIDGE_HOME", &home_b)
         .env("RUST_LOG", "warn")
-        .output()
-        .expect("run client");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn client");
+    client
+        .stdin
+        .take()
+        .expect("client stdin")
+        .write_all(b"y\n")
+        .expect("confirm client pairing");
+    let client = client.wait_with_output().expect("run client");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {

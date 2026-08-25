@@ -27,9 +27,6 @@ enum Command {
         /// Connect to host:port instead of discovering on the LAN
         #[arg(long)]
         connect: Option<String>,
-        /// Confirm pairing without prompting (the codes must still match)
-        #[arg(long)]
-        yes: bool,
     },
     /// Show whether the daemon is running and who it is paired with
     Status,
@@ -72,9 +69,7 @@ async fn real_main() -> Result<()> {
             Ok(())
         }
         Some(Command::Start) => daemon::run(cfg, paths, identity).await,
-        Some(Command::Pair { connect, yes }) => {
-            pairing::run(&cfg, &paths, &identity, connect, yes).await
-        }
+        Some(Command::Pair { connect }) => pairing::run(&cfg, &paths, &identity, connect).await,
         Some(Command::Status) => print_status(&paths, &identity),
         Some(Command::List) => print_list(&paths),
         Some(Command::Unpair { device_id }) => unpair(&paths, &device_id),

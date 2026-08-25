@@ -8,6 +8,10 @@ ExecStart=%h/.cargo/bin/pastebridge start
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=pastebridge=info
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=default.target

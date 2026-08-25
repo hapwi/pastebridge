@@ -26,16 +26,18 @@ impl PinStore {
     }
 
     pub fn replace(&self, pins: Vec<[u8; 32]>) {
-        *self.inner.write().expect("pin lock") = pins;
+        match self.inner.write() {
+            Ok(mut stored) => *stored = pins,
+            Err(poisoned) => *poisoned.into_inner() = pins,
+        }
     }
 
     pub fn contains(&self, der: &[u8]) -> bool {
         let hash = cert_sha256(der);
-        self.inner
-            .read()
-            .expect("pin lock")
-            .iter()
-            .any(|p| p == &hash)
+        match self.inner.read() {
+            Ok(stored) => stored.iter().any(|pin| pin == &hash),
+            Err(poisoned) => poisoned.into_inner().iter().any(|pin| pin == &hash),
+        }
     }
 }
 

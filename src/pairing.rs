@@ -1,14 +1,18 @@
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use quinn::{Connection, Endpoint};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::{parse_addr, Config, Paths};
 use crate::crypto::{device_id_from_cert, sas_code};
-use crate::discovery::{self, PAIR_SERVICE};
+use crate::discovery::{self, TailscaleNetwork, PAIR_SERVICE};
 use crate::identity::{Identity, Peer, PeerList};
 use crate::protocol::{self, Msg, PROTO};
 use crate::tls::{self, peer_cert};
@@ -18,9 +22,19 @@ pub async fn run(
     paths: &Paths,
     identity: &Identity,
     connect: Option<String>,
-    yes: bool,
 ) -> Result<()> {
     let connecting = connect.is_some();
+    let tailscale = if connecting {
+        None
+    } else {
+        match discovery::tailscale_network() {
+            Ok(network) => network,
+            Err(err) => {
+                warn!("Tailscale detection unavailable: {err}");
+                None
+            }
+        }
+    };
     let mdns = if connecting {
         None
     } else {
@@ -51,7 +65,7 @@ pub async fn run(
         (ep.clone(), ep)
     } else {
         let server = tls::pairing_server(identity)?;
-        let bind: SocketAddr = format!("0.0.0.0:{}", cfg.pair_port).parse()?;
+        let bind = SocketAddr::from((cfg.bind_address, cfg.pair_port));
         let ep = Endpoint::server(server, bind)?;
         let mut client_endpoint = ep.clone();
         client_endpoint.set_default_client_config(client_cfg);
@@ -61,19 +75,34 @@ pub async fn run(
     println!();
     println!("  Device : {} ({})", identity.name, identity.device_id);
     if !connecting {
-        println!("  Listen : 0.0.0.0:{}", cfg.pair_port);
+        println!("  Listen : {}:{}", cfg.bind_address, cfg.pair_port);
     }
     if advertised {
         println!("  LAN    : advertising via mDNS");
+    }
+    if let Some(network) = tailscale.as_ref() {
+        println!(
+            "  Tailnet: {} ({} online peer address{})",
+            network.local_ip,
+            network.peer_ips.len(),
+            if network.peer_ips.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
+        );
     }
     if !connecting {
         println!();
         println!("  On the other computer, run the same command:");
         println!("      pastebridge pair");
-        if let Some(ip) = discovery::local_ipv4s().first() {
+        if tailscale.is_none() {
             println!();
-            println!("  If the computers are not on the same LAN (Tailscale, VPN):");
-            println!("      pastebridge pair --connect {ip}:{}", cfg.pair_port);
+            println!("  For another network, install and start Tailscale on both computers");
+            println!(
+                "  or use: pastebridge pair --connect <address>:{}",
+                cfg.pair_port
+            );
         }
         println!();
         println!("  Waiting for the other computer…  (Ctrl+C to cancel)");
@@ -92,6 +121,7 @@ pub async fn run(
             mdns.as_ref(),
             &our_id,
             cfg.pair_port,
+            tailscale,
         )
         .await?
     };
@@ -132,10 +162,10 @@ pub async fn run(
         }
         _ => bail!("expected hello"),
     };
+    validate_peer_name(&peer_name)?;
 
-    if peer_hello_id != peer_id && !peer_hello_id.is_empty() {
-        // Prefer the id derived from the cert; hello is informational.
-        tracing::debug!("hello id {peer_hello_id} vs cert id {peer_id}");
+    if peer_hello_id != peer_id {
+        bail!("peer identity does not match its TLS certificate");
     }
 
     println!();
@@ -146,21 +176,16 @@ pub async fn run(
     println!("  └─────────────────────┘");
     println!();
     println!("  Look at the other screen. The codes must match.");
-    let confirmed = if yes {
-        println!("  Auto-confirming (--yes).");
-        true
-    } else {
-        print!("  Pair this computer with {peer_name}? [y/N] ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let answer = tokio::task::spawn_blocking(|| {
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).ok();
-            line
-        })
-        .await
-        .unwrap_or_default();
-        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    };
+    print!("  Pair this computer with {peer_name}? [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let answer = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        line
+    })
+    .await
+    .unwrap_or_default();
+    let confirmed = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
 
     if !confirmed {
         let _ = protocol::write_msg(&mut send, &Msg::PairAbort).await;
@@ -187,7 +212,7 @@ pub async fn run(
         name: peer_name.clone(),
         cert_sha256: crate::crypto::cert_fingerprint(peer_der.as_ref()),
         cert_pem,
-        last_addr: conn.remote_address().to_string().into(),
+        last_addr: Some(SocketAddr::new(conn.remote_address().ip(), cfg.port).to_string()),
         paired_at: now_rfc3339(),
     });
     peers.save(paths)?;
@@ -210,17 +235,27 @@ async fn wait_for_peer(
     mdns: Option<&mdns_sd::ServiceDaemon>,
     our_id: &str,
     pair_port: u16,
+    tailscale: Option<TailscaleNetwork>,
 ) -> Result<(Connection, bool)> {
-    let (tx, mut rx) = mpsc::channel::<(Connection, bool)>(4);
+    let (tx, mut rx) = mpsc::channel::<(Connection, bool)>(8);
+    let selected = Arc::new(AtomicBool::new(false));
+    let tailscale_available = tailscale.is_some();
 
     let ep = endpoint.clone();
     let tx_in = tx.clone();
+    let incoming_selected = selected.clone();
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             match incoming.await {
                 Ok(conn) => {
-                    let _ = tx_in.send((conn, false)).await;
-                    return;
+                    if incoming_selected
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let _ = tx_in.send((conn, false)).await;
+                        return;
+                    }
+                    conn.close(0u32.into(), b"another pairing connection was selected");
                 }
                 Err(err) => warn!("incoming pairing handshake failed: {err}"),
             }
@@ -231,7 +266,15 @@ async fn wait_for_peer(
         if let Ok(mut browse) = discovery::browse(mdns, PAIR_SERVICE) {
             let our_id = our_id.to_string();
             let client_endpoint = client_endpoint.clone();
+            let tx_mdns = tx.clone();
+            let mdns_selected = selected.clone();
             tokio::spawn(async move {
+                if tailscale_available {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if mdns_selected.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
                 while let Some(found) = browse.recv().await {
                     if found.device_id == our_id {
                         continue;
@@ -249,16 +292,46 @@ async fn wait_for_peer(
                     );
                     match connect_to(&client_endpoint, found.addr).await {
                         Ok(conn) => {
-                            let _ = tx.send((conn, true)).await;
-                            return;
+                            if mdns_selected
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                let _ = tx_mdns.send((conn, true)).await;
+                                return;
+                            }
+                            conn.close(0u32.into(), b"another pairing connection was selected");
                         }
                         Err(err) => warn!("connect to {} failed: {err}", found.addr),
                     }
                 }
             });
         }
-    } else {
-        let _ = pair_port;
+    }
+
+    if let Some(network) = tailscale {
+        for peer_ip in network.peer_ips {
+            if network.local_ip >= peer_ip {
+                continue;
+            }
+            let endpoint = client_endpoint.clone();
+            let tx = tx.clone();
+            let tailscale_selected = selected.clone();
+            tokio::spawn(async move {
+                let addr = SocketAddr::from((peer_ip, pair_port));
+                let connected =
+                    tokio::time::timeout(Duration::from_secs(8), connect_to(&endpoint, addr)).await;
+                if let Ok(Ok(conn)) = connected {
+                    if tailscale_selected
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let _ = tx.send((conn, true)).await;
+                    } else {
+                        conn.close(0u32.into(), b"another pairing connection was selected");
+                    }
+                }
+            });
+        }
     }
 
     tokio::time::timeout(Duration::from_secs(300), rx.recv())
@@ -268,10 +341,10 @@ async fn wait_for_peer(
 }
 
 async fn connect_to(endpoint: &Endpoint, addr: SocketAddr) -> Result<Connection> {
-    Ok(endpoint
+    endpoint
         .connect(addr, "pastebridge")?
         .await
-        .with_context(|| format!("connecting to {addr}"))?)
+        .with_context(|| format!("connecting to {addr}"))
 }
 
 fn resolve_addr(s: &str, default_port: u16) -> Result<SocketAddr> {
@@ -290,7 +363,6 @@ fn resolve_addr(s: &str, default_port: u16) -> Result<SocketAddr> {
 }
 
 fn der_to_pem(der: &[u8]) -> Result<String> {
-    use base64::engine::general_purpose::STANDARD;
     let b64 = STANDARD.encode(der);
     let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
     for chunk in b64.as_bytes().chunks(64) {
@@ -302,8 +374,14 @@ fn der_to_pem(der: &[u8]) -> Result<String> {
 }
 
 fn now_rfc3339() -> String {
-    use time::format_description::well_known::Rfc3339;
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".into())
+}
+
+fn validate_peer_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        bail!("peer sent an invalid device name");
+    }
+    Ok(())
 }
