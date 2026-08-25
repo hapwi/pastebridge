@@ -74,8 +74,8 @@ pub fn run(cfg: &Config, paths: &Paths, identity: &Identity) -> Result<()> {
             println!(
                 "  local {} — {} online peer address{}",
                 network.local_ip,
-                network.peer_ips.len(),
-                if network.peer_ips.len() == 1 {
+                network.peer_ips().len(),
+                if network.peer_ips().len() == 1 {
                     ""
                 } else {
                     "es"

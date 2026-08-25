@@ -37,17 +37,16 @@ Linux users on Wayland should have `wl-clipboard` (the installer tries to add it
 The code is computed from the TLS certificates. A machine in the middle would show a *different* code, so do not confirm if they disagree.
 
 If Tailscale is installed, running, and logged into the same tailnet on both
-computers, use the normal command on both:
+computers, run the same command on both:
 
 ```bash
 pastebridge pair
 ```
 
 Pastebridge reads `tailscale status --json` and `tailscale ip -4` directly,
-discovers online tailnet peers, and keeps LAN mDNS as a fallback. It does not
-change Tailscale settings or bypass tailnet policy. If automatic discovery is
-unavailable, one side can still use
-`pastebridge pair --connect 100.x.y.z:27420`.
+discovers online desktop peers on the tailnet, and keeps LAN mDNS as a fallback.
+It skips phones and other mobile Tailscale nodes. It does not change Tailscale
+settings or bypass tailnet policy.
 
 After pairing, the daemon automatically retries saved LAN addresses and current
 Tailscale addresses. Both computers still need to be online, Pastebridge and

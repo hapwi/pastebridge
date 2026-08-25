@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use quinn::{Connection, Endpoint};
-use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -85,16 +85,16 @@ pub async fn run(
         println!("  LAN    : advertising via mDNS");
     }
     if let Some(network) = tailscale.as_ref() {
+        let desktop: Vec<_> = network.pairable_peers().collect();
         println!(
-            "  Tailnet: {} ({} online peer address{})",
+            "  Tailnet: {} ({} desktop peer{})",
             network.local_ip,
-            network.peer_ips.len(),
-            if network.peer_ips.len() == 1 {
-                ""
-            } else {
-                "es"
-            }
+            desktop.len(),
+            if desktop.len() == 1 { "" } else { "s" }
         );
+        for peer in desktop {
+            println!("           {} ({})", peer.ip, peer.name);
+        }
     }
     if !connecting {
         println!();
@@ -110,21 +110,14 @@ pub async fn run(
         }
         println!();
         println!("  Waiting for the other computer…  (Ctrl+C to cancel)");
-        if let Some(network) = tailscale.as_ref() {
-            println!("  If this sits here, on the other computer run:");
-            println!(
-                "      pastebridge pair --connect {}:{}",
-                network.local_ip, cfg.pair_port
-            );
-        }
         println!();
     }
 
     let our_id = identity.device_id.clone();
-    let (conn, as_client) = if let Some(target) = connect {
+    let conn = if let Some(target) = connect {
         let addr = resolve_addr(&target, cfg.pair_port)?;
         println!("  Connecting to {addr}…");
-        (connect_to(&client_endpoint, addr).await?, true)
+        connect_to(&client_endpoint, addr).await?
     } else {
         wait_for_peer(
             &endpoint,
@@ -142,7 +135,7 @@ pub async fn run(
     let sas = sas_code(our_der.as_ref(), peer_der.as_ref());
     let peer_id = device_id_from_cert(peer_der.as_ref());
 
-    let (mut send, mut recv) = if as_client {
+    let (mut send, mut recv) = if we_open_pairing_stream(&our_id, &peer_id) {
         conn.open_bi().await?
     } else {
         conn.accept_bi().await?
@@ -240,12 +233,48 @@ pub async fn run(
     Ok(())
 }
 
-fn should_dial_ip(local: Ipv4Addr, peer: Ipv4Addr) -> bool {
-    local < peer
+fn we_open_pairing_stream(our_id: &str, peer_id: &str) -> bool {
+    our_id < peer_id
 }
 
-fn should_dial_device(our_id: &str, their_id: &str) -> bool {
-    our_id < their_id
+fn preferred_pairing_path(our_id: &str, peer_id: &str, we_initiated: bool) -> bool {
+    we_initiated == (our_id < peer_id)
+}
+
+async fn offer_connection(
+    conn: Connection,
+    we_initiated: bool,
+    our_id: &str,
+    tx: mpsc::Sender<Connection>,
+    selected: Arc<AtomicBool>,
+) {
+    let peer_id = match peer_cert(&conn) {
+        Ok(der) => device_id_from_cert(der.as_ref()),
+        Err(err) => {
+            warn!("pairing connection had no certificate: {err}");
+            conn.close(0u32.into(), b"missing certificate");
+            return;
+        }
+    };
+    if peer_id == our_id {
+        conn.close(0u32.into(), b"connected to self");
+        return;
+    }
+    if !preferred_pairing_path(our_id, &peer_id, we_initiated) {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if selected.load(Ordering::Acquire) {
+            conn.close(0u32.into(), b"another pairing connection was selected");
+            return;
+        }
+    }
+    if selected
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = tx.send(conn).await;
+    } else {
+        conn.close(0u32.into(), b"another pairing connection was selected");
+    }
 }
 
 async fn wait_for_peer(
@@ -255,41 +284,43 @@ async fn wait_for_peer(
     our_id: &str,
     pair_port: u16,
     tailscale: Option<TailscaleNetwork>,
-) -> Result<(Connection, bool)> {
-    let (tx, mut rx) = mpsc::channel::<(Connection, bool)>(8);
+) -> Result<Connection> {
+    let (tx, mut rx) = mpsc::channel::<Connection>(8);
     let selected = Arc::new(AtomicBool::new(false));
-    let targets: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let targets: Arc<Mutex<HashMap<SocketAddr, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    if let Some(network) = &tailscale {
+        if let Ok(mut guard) = targets.lock() {
+            for peer in network.pairable_peers() {
+                guard
+                    .entry(SocketAddr::from((peer.ip, pair_port)))
+                    .or_insert_with(|| peer.name.clone());
+            }
+        }
+    }
 
     let ep = endpoint.clone();
     let tx_in = tx.clone();
     let incoming_selected = selected.clone();
+    let incoming_id = our_id.to_string();
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
+            if incoming_selected.load(Ordering::Acquire) {
+                return;
+            }
             match incoming.await {
                 Ok(conn) => {
-                    if incoming_selected
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        let _ = tx_in.send((conn, false)).await;
-                        return;
-                    }
-                    conn.close(0u32.into(), b"another pairing connection was selected");
+                    let tx_in = tx_in.clone();
+                    let incoming_selected = incoming_selected.clone();
+                    let incoming_id = incoming_id.clone();
+                    tokio::spawn(async move {
+                        offer_connection(conn, false, &incoming_id, tx_in, incoming_selected).await;
+                    });
                 }
                 Err(err) => warn!("incoming pairing handshake failed: {err}"),
             }
         }
     });
-
-    if let Some(network) = &tailscale {
-        if let Ok(mut guard) = targets.lock() {
-            for peer_ip in &network.peer_ips {
-                if should_dial_ip(network.local_ip, *peer_ip) {
-                    guard.insert(SocketAddr::from((*peer_ip, pair_port)));
-                }
-            }
-        }
-    }
 
     if let Some(mdns) = mdns {
         if let Ok(mut browse) = discovery::browse(mdns, PAIR_SERVICE) {
@@ -304,48 +335,38 @@ async fn wait_for_peer(
                     if found.device_id == our_id {
                         continue;
                     }
-                    if should_dial_device(&our_id, &found.device_id) {
-                        println!(
-                            "  Found {} on the LAN at {}; connecting…",
-                            found.name, found.addr
-                        );
-                        if let Ok(mut guard) = targets.lock() {
-                            guard.insert(found.addr);
-                        }
-                    } else {
-                        println!(
-                            "  Found {} on the LAN; waiting for them to connect",
-                            found.name
-                        );
+                    println!("  Found {} on the LAN at {}", found.name, found.addr);
+                    if let Ok(mut guard) = targets.lock() {
+                        guard
+                            .entry(found.addr)
+                            .or_insert_with(|| found.name.clone());
                     }
                 }
             });
         }
     }
 
-    let elected = targets
-        .lock()
-        .ok()
-        .is_some_and(|guard| !guard.is_empty());
-    if !elected {
-        let fallback_targets = targets.clone();
-        let fallback_selected = selected.clone();
-        let fallback_peers = tailscale.as_ref().map(|network| network.peer_ips.clone());
+    if tailscale.is_some() {
+        let refresh_targets = targets.clone();
+        let refresh_selected = selected.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(8)).await;
-            if fallback_selected.load(Ordering::Acquire) {
-                return;
-            }
-            let Some(peer_ips) = fallback_peers else {
-                return;
-            };
-            if peer_ips.is_empty() {
-                return;
-            }
-            println!("  Still waiting; trying Tailscale from this side…");
-            if let Ok(mut guard) = fallback_targets.lock() {
-                for peer_ip in peer_ips {
-                    guard.insert(SocketAddr::from((peer_ip, pair_port)));
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if refresh_selected.load(Ordering::Acquire) {
+                    return;
+                }
+                let network = tokio::task::spawn_blocking(discovery::tailscale_network).await;
+                let Ok(Ok(Some(network))) = network else {
+                    continue;
+                };
+                if let Ok(mut guard) = refresh_targets.lock() {
+                    for peer in network.pairable_peers() {
+                        guard
+                            .entry(SocketAddr::from((peer.ip, pair_port)))
+                            .or_insert_with(|| peer.name.clone());
+                    }
                 }
             }
         });
@@ -354,35 +375,42 @@ async fn wait_for_peer(
     let dial_endpoint = client_endpoint.clone();
     let dial_tx = tx.clone();
     let dial_selected = selected.clone();
-    let dial_targets = targets.clone();
+    let dial_targets = targets;
+    let dial_id = our_id.to_string();
     tokio::spawn(async move {
-        let mut announced = HashSet::new();
-        let mut reported_fail = HashSet::new();
+        let mut announced = HashMap::new();
+        let mut warmed = HashMap::new();
         loop {
             if dial_selected.load(Ordering::Acquire) {
                 return;
             }
             let addrs = match dial_targets.lock() {
-                Ok(guard) => guard.iter().copied().collect::<Vec<_>>(),
+                Ok(guard) => guard
+                    .iter()
+                    .map(|(addr, name)| (*addr, name.clone()))
+                    .collect::<Vec<_>>(),
                 Err(_) => Vec::new(),
             };
             let mut attempts = tokio::task::JoinSet::new();
-            for addr in addrs {
-                if announced.insert(addr) {
-                    println!("  Trying {addr}…");
+            for (addr, name) in addrs {
+                if announced.insert(addr, name.clone()).is_none() {
+                    println!("  Trying {name} at {addr}…");
+                    if let std::net::IpAddr::V4(ip) = addr.ip() {
+                        if warmed.insert(ip, ()).is_none() {
+                            tokio::task::spawn_blocking(move || discovery::tailscale_ping(ip));
+                        }
+                    }
                 }
                 let endpoint = dial_endpoint.clone();
                 attempts.spawn(async move {
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(6),
-                        connect_to(&endpoint, addr),
-                    )
-                    .await;
-                    (addr, result)
+                    let result =
+                        tokio::time::timeout(Duration::from_secs(8), connect_to(&endpoint, addr))
+                            .await;
+                    (addr, name, result)
                 });
             }
             while let Some(joined) = attempts.join_next().await {
-                let Ok((addr, connected)) = joined else {
+                let Ok((addr, name, connected)) = joined else {
                     continue;
                 };
                 if dial_selected.load(Ordering::Acquire) {
@@ -393,28 +421,15 @@ async fn wait_for_peer(
                 }
                 match connected {
                     Ok(Ok(conn)) => {
-                        if dial_selected
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            let _ = dial_tx.send((conn, true)).await;
-                            return;
-                        }
-                        conn.close(0u32.into(), b"another pairing connection was selected");
-                        return;
+                        let tx = dial_tx.clone();
+                        let selected = dial_selected.clone();
+                        let our_id = dial_id.clone();
+                        tokio::spawn(async move {
+                            offer_connection(conn, true, &our_id, tx, selected).await;
+                        });
                     }
-                    Ok(Err(err)) => {
-                        if reported_fail.insert(addr) {
-                            println!("  Could not reach {addr} yet; retrying…");
-                        }
-                        warn!("connect to {addr} failed: {err}");
-                    }
-                    Err(_) => {
-                        if reported_fail.insert(addr) {
-                            println!("  Could not reach {addr} yet; retrying…");
-                        }
-                        warn!("connect to {addr} timed out");
-                    }
+                    Ok(Err(err)) => warn!("connect to {name} ({addr}) failed: {err}"),
+                    Err(_) => warn!("connect to {name} ({addr}) timed out"),
                 }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -475,20 +490,27 @@ fn validate_peer_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_dial_device, should_dial_ip};
-    use std::net::Ipv4Addr;
+    use super::{preferred_pairing_path, we_open_pairing_stream};
 
     #[test]
-    fn smaller_tailscale_ip_dials() {
-        let mac = Ipv4Addr::new(100, 86, 163, 95);
-        let fedora = Ipv4Addr::new(100, 118, 57, 56);
-        assert!(should_dial_ip(mac, fedora));
-        assert!(!should_dial_ip(fedora, mac));
+    fn smaller_device_id_opens_the_pairing_stream() {
+        assert!(we_open_pairing_stream(
+            "726fee597cbe41c6",
+            "b1c67afe4a8c044f"
+        ));
+        assert!(!we_open_pairing_stream(
+            "b1c67afe4a8c044f",
+            "726fee597cbe41c6"
+        ));
     }
 
     #[test]
-    fn smaller_device_id_dials() {
-        assert!(should_dial_device("726fee597cbe41c6", "b1c67afe4a8c044f"));
-        assert!(!should_dial_device("b1c67afe4a8c044f", "726fee597cbe41c6"));
+    fn smaller_device_id_is_the_preferred_initiator() {
+        let mac = "726fee597cbe41c6";
+        let fedora = "b1c67afe4a8c044f";
+        assert!(preferred_pairing_path(mac, fedora, true));
+        assert!(preferred_pairing_path(fedora, mac, false));
+        assert!(!preferred_pairing_path(mac, fedora, false));
+        assert!(!preferred_pairing_path(fedora, mac, true));
     }
 }

@@ -263,8 +263,8 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                     if let Ok(Ok(Some(network))) = tailscale {
                         let limit = Arc::new(Semaphore::new(16));
                         let mut attempts = tokio::task::JoinSet::new();
-                        for peer_ip in network.peer_ips {
-                            let addr = SocketAddr::from((peer_ip, port));
+                        for peer in network.pairable_peers() {
+                            let addr = SocketAddr::from((peer.ip, port));
                             let connector = connector.clone();
                             let limit = limit.clone();
                             attempts.spawn(async move {

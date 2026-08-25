@@ -24,9 +24,35 @@ pub struct FoundPeer {
 }
 
 #[derive(Debug, Clone)]
+pub struct TailscalePeer {
+    pub name: String,
+    pub os: String,
+    pub ip: Ipv4Addr,
+}
+
+impl TailscalePeer {
+    pub fn is_pairable(&self) -> bool {
+        is_pairable_os(&self.os)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TailscaleNetwork {
     pub local_ip: Ipv4Addr,
-    pub peer_ips: Vec<Ipv4Addr>,
+    pub peers: Vec<TailscalePeer>,
+}
+
+impl TailscaleNetwork {
+    pub fn peer_ips(&self) -> Vec<Ipv4Addr> {
+        let mut ips: Vec<_> = self.peers.iter().map(|peer| peer.ip).collect();
+        ips.sort_unstable();
+        ips.dedup();
+        ips
+    }
+
+    pub fn pairable_peers(&self) -> impl Iterator<Item = &TailscalePeer> {
+        self.peers.iter().filter(|peer| peer.is_pairable())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +65,10 @@ struct RawTailscaleStatus {
 
 #[derive(Debug, Deserialize)]
 struct RawTailscalePeer {
+    #[serde(rename = "HostName", default)]
+    host_name: String,
+    #[serde(rename = "OS", default)]
+    os: String,
     #[serde(rename = "Online", default)]
     online: bool,
     #[serde(rename = "TailscaleIPs", default)]
@@ -92,6 +122,17 @@ pub fn tailscale_network() -> Result<Option<TailscaleNetwork>> {
         command_output_limited(&binary, &["status", "--json"], MAX_TAILSCALE_STATUS_BYTES)
             .context("running `tailscale status --json`")?;
     parse_tailscale_status(&status_output, local_ip).map(Some)
+}
+
+pub fn tailscale_ping(ip: Ipv4Addr) {
+    let Some(binary) = tailscale_binary() else {
+        return;
+    };
+    let _ = command_output_limited(
+        &binary,
+        &["ping", "-c", "1", &ip.to_string()],
+        32 * 1024,
+    );
 }
 
 pub fn advertise(
@@ -193,11 +234,16 @@ fn parse_tailscale_status(bytes: &[u8], local_ip: Ipv4Addr) -> Result<TailscaleN
         anyhow::bail!("Tailscale status contains too many peers");
     }
 
-    let mut peer_ips = Vec::new();
+    let mut peers = Vec::new();
     for peer in status.peers.into_values() {
         if !peer.online || peer.tailscale_ips.len() > MAX_TAILSCALE_IPS_PER_PEER {
             continue;
         }
+        let name = if peer.host_name.trim().is_empty() {
+            "tailscale-peer".to_string()
+        } else {
+            peer.host_name
+        };
         for raw_ip in peer.tailscale_ips {
             if raw_ip.len() > 45 {
                 continue;
@@ -206,13 +252,25 @@ fn parse_tailscale_status(bytes: &[u8], local_ip: Ipv4Addr) -> Result<TailscaleN
                 continue;
             };
             if ip != local_ip && is_usable_ipv4(&ip) {
-                peer_ips.push(ip);
+                peers.push(TailscalePeer {
+                    name: name.clone(),
+                    os: peer.os.clone(),
+                    ip,
+                });
             }
         }
     }
-    peer_ips.sort_unstable();
-    peer_ips.dedup();
-    Ok(TailscaleNetwork { local_ip, peer_ips })
+    peers.sort_by_key(|peer| peer.ip);
+    peers.dedup_by_key(|peer| peer.ip);
+    Ok(TailscaleNetwork { local_ip, peers })
+}
+
+pub fn is_pairable_os(os: &str) -> bool {
+    let os = os.to_ascii_lowercase();
+    !(os.contains("ios")
+        || os.contains("android")
+        || os.contains("tvos")
+        || os.contains("watchos"))
 }
 
 fn command_output_limited(binary: &Path, args: &[&str], max_bytes: usize) -> Result<Vec<u8>> {
@@ -312,7 +370,31 @@ mod tests {
             }
         }"#;
         let network = parse_tailscale_status(status, Ipv4Addr::new(100, 64, 0, 1)).unwrap();
-        assert_eq!(network.peer_ips, vec![Ipv4Addr::new(100, 64, 0, 2)]);
+        assert_eq!(network.peer_ips(), vec![Ipv4Addr::new(100, 64, 0, 2)]);
+    }
+
+    #[test]
+    fn skips_phones_when_listing_pairable_peers() {
+        let status = br#"{
+            "BackendState": "Running",
+            "Peer": {
+                "phone": {
+                    "HostName": "localhost",
+                    "OS": "iOS",
+                    "Online": true,
+                    "TailscaleIPs": ["100.81.134.90"]
+                },
+                "mac": {
+                    "HostName": "Petes-MacBook-Air",
+                    "OS": "macOS",
+                    "Online": true,
+                    "TailscaleIPs": ["100.86.163.95"]
+                }
+            }
+        }"#;
+        let network = parse_tailscale_status(status, Ipv4Addr::new(100, 118, 57, 56)).unwrap();
+        let pairable: Vec<_> = network.pairable_peers().map(|peer| peer.ip).collect();
+        assert_eq!(pairable, vec![Ipv4Addr::new(100, 86, 163, 95)]);
     }
 
     #[test]
