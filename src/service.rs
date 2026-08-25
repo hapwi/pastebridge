@@ -74,7 +74,6 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
         exe = exe.display()
     );
     fs::write(&path, unit)?;
-    println!("Wrote {}", path.display());
 
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -84,10 +83,9 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
         .status()
         .context("running systemctl")?;
     if enable.success() {
-        println!("Enabled user service `pastebridge.service`.");
-        println!("It will start whenever you log in.");
+        println!("  login service enabled");
     } else {
-        println!("Could not enable via systemctl. Start it yourself with:");
+        println!("  could not enable the login service");
         println!("  systemctl --user enable --now pastebridge.service");
     }
     Ok(())
@@ -101,7 +99,7 @@ fn uninstall_systemd() -> Result<()> {
     if let Ok(path) = unit_path() {
         let _ = fs::remove_file(path);
     }
-    println!("Removed the Pastebridge user service.");
+    println!("  login service removed");
     Ok(())
 }
 
@@ -163,10 +161,9 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
         .args(["enable", &format!("{domain}/dev.pastebridge.daemon")])
         .status();
     if load.success() {
-        println!("Installed LaunchAgent {}", path.display());
-        println!("Pastebridge will start when you log in.");
+        println!("  login service enabled");
     } else {
-        println!("Wrote {} — load it with:", path.display());
+        println!("  wrote {} — load it with:", path.display());
         println!("  launchctl bootstrap gui/$UID {}", path.display());
     }
     Ok(())
@@ -182,6 +179,6 @@ fn uninstall_launchd() -> Result<()> {
     if let Ok(path) = plist_path() {
         let _ = fs::remove_file(path);
     }
-    println!("Removed the Pastebridge LaunchAgent.");
+    println!("  login service removed");
     Ok(())
 }

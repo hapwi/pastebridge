@@ -9,118 +9,86 @@ use crate::identity::{Identity, PeerList};
 use crate::Config;
 
 pub fn run(cfg: &Config, paths: &Paths, identity: &Identity) -> Result<()> {
-    println!("Pastebridge doctor");
-    println!("==================");
-    println!();
-
     let mut failed = 0;
 
-    check("config directory", paths.config_dir.exists(), &mut failed);
-    println!("  {}", paths.config_dir.display());
+    println!();
+    println!("  {}", identity.name);
 
-    check("identity", paths.identity_file.exists(), &mut failed);
-    println!("  device {} ({})", identity.name, identity.device_id);
+    if !paths.config_dir.exists() {
+        fail(
+            "config",
+            &paths.config_dir.display().to_string(),
+            &mut failed,
+        );
+    }
 
     let peers = PeerList::load(paths)?;
-    check("paired devices", !peers.peers.is_empty(), &mut failed);
     if peers.peers.is_empty() {
-        println!("  none yet — run `pastebridge pair` on both computers");
+        println!("  paired     none");
     } else {
-        for peer in &peers.peers {
-            println!("  {} ({})", peer.name, peer.device_id);
-        }
+        let names: Vec<_> = peers.peers.iter().map(|p| p.name.as_str()).collect();
+        println!("  paired     {}", names.join(", "));
     }
 
     match Clipboard::open() {
-        Ok(mut cb) => {
-            check(&format!("clipboard ({})", cb.backend), true, &mut failed);
-            match cb.read() {
-                Some(clip) => {
-                    println!("  current item: {} ({} bytes)", clip.mime, clip.bytes.len())
-                }
-                None => println!("  clipboard is empty (that is ok)"),
-            }
-        }
-        Err(err) => {
-            check(&format!("clipboard ({err})"), false, &mut failed);
-        }
+        Ok(mut cb) => match cb.read() {
+            Some(clip) => println!(
+                "  clipboard  {}  {}  {} B",
+                cb.backend,
+                clip.mime,
+                clip.bytes.len()
+            ),
+            None => println!("  clipboard  {}  empty", cb.backend),
+        },
+        Err(err) => fail("clipboard", &err.to_string(), &mut failed),
     }
 
-    let port_ok = UdpSocket::bind(("0.0.0.0", cfg.port)).is_ok();
-    check(
-        &format!("UDP port {} free for setup", cfg.port),
-        port_ok || daemon::running_pid(paths).is_some(),
-        &mut failed,
-    );
+    let daemon_pid = daemon::running_pid(paths);
+    let port_ok = UdpSocket::bind(("0.0.0.0", cfg.port)).is_ok() || daemon_pid.is_some();
+    if !port_ok {
+        fail("port", &format!("{} in use", cfg.port), &mut failed);
+    }
 
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        let wl = which("wl-copy") && which("wl-paste");
-        check("wl-clipboard (Wayland)", wl, &mut failed);
-        if !wl {
-            println!("  install it:  sudo dnf install wl-clipboard");
-            println!("               sudo apt install wl-clipboard");
-        }
-        if gnome_wayland() {
-            println!();
-            println!("  Note: GNOME Wayland has limited clipboard APIs.");
-            println!("  If paste from the other computer is unreliable,");
-            println!("  install wl-clipboard and keep a terminal session logged in.");
-        }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && !(which("wl-copy") && which("wl-paste")) {
+        fail(
+            "wl-clipboard",
+            "install with  sudo dnf install wl-clipboard",
+            &mut failed,
+        );
     }
 
     match discovery::tailscale_network() {
         Ok(Some(network)) => {
-            check("Tailscale (automatic)", true, &mut failed);
+            let n = network.pairable_peers().count();
             println!(
-                "  local {} — {} online peer address{}",
+                "  tailscale  {}  {} peer{}",
                 network.local_ip,
-                network.peer_ips().len(),
-                if network.peer_ips().len() == 1 {
-                    ""
-                } else {
-                    "es"
-                }
+                n,
+                if n == 1 { "" } else { "s" }
             );
         }
-        Ok(None) => println!("[--]  Tailscale not installed (LAN discovery remains enabled)"),
-        Err(err) => println!("[--]  Tailscale unavailable ({err}); LAN discovery remains enabled"),
+        Ok(None) | Err(_) => {}
     }
 
-    if let Some(pid) = daemon::running_pid(paths) {
-        println!();
-        println!("  daemon is running (pid {pid})");
-    } else {
-        println!();
-        println!("  daemon is not running — start it with `pastebridge start`");
-        println!("  or `pastebridge install-service`");
+    match daemon_pid {
+        Some(pid) => println!("  daemon     running  pid {pid}"),
+        None => println!("  daemon     stopped"),
     }
 
     println!();
-    if failed == 0 {
-        println!("All checks passed.");
-    } else {
-        println!("{failed} check(s) need attention.");
+    if failed > 0 {
+        println!("  {failed} need attention");
+        println!();
     }
     Ok(())
 }
 
-fn check(label: &str, ok: bool, failed: &mut i32) {
-    if ok {
-        println!("[ok]  {label}");
-    } else {
-        println!("[!!]  {label}");
-        *failed += 1;
-    }
+fn fail(label: &str, detail: &str, failed: &mut i32) {
+    println!("! {label:<10} {detail}");
+    *failed += 1;
 }
 
 fn which(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
-}
-
-fn gnome_wayland() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .map(|v| v.to_ascii_uppercase().contains("GNOME"))
-        .unwrap_or(false)
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }

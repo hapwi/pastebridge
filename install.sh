@@ -186,7 +186,7 @@ install_prebuilt() {
   url="${REPO_HTTPS}/releases/download/${RELEASE_TAG}/${archive}"
   tmp="$(mktemp -d)"
 
-  say "Downloading Pastebridge (${target})…"
+  say "Downloading ${target}…"
   if ! curl -fsSL "$url" -o "$tmp/$archive"; then
     rm -rf "$tmp"
     say "No prebuilt binary at $url"
@@ -264,8 +264,6 @@ Re-run after the stable release exists, or install Rust and set PASTEBRIDGE_FROM
 
 main() {
   say "Pastebridge"
-  say "Copy on macOS, paste on Linux — encrypted, local, no account."
-  say
 
   [[ "$(os_name)" == Darwin || "$(os_name)" == Linux ]] \
     || fail "Pastebridge supports macOS and Linux"
@@ -279,24 +277,14 @@ main() {
   [[ -n "$INSTALLED_BIN" && -x "$INSTALLED_BIN" ]] \
     || fail "pastebridge did not install into $INSTALL_DIR"
 
-  say
-  say "Installed: $INSTALLED_BIN"
+  say "Installed $INSTALLED_BIN"
   if ! "$INSTALLED_BIN" install-service; then
-    say "The login service could not be enabled automatically."
-    say "Run this after resolving the reported issue: pastebridge install-service"
+    say "Could not enable the login service. Later run: pastebridge install-service"
   fi
-  "$INSTALLED_BIN" doctor || true
   say
-  say "Next, pair this computer with the other one:"
-  say "  pastebridge pair"
-  say
-  say "On the other computer run the same installer, then pastebridge pair."
-  say "Compare the 8-digit codes. If they match, type y on both."
-  say "The login service is already enabled; syncing starts after pairing."
-  say
+  say "Next: pastebridge pair"
   if [[ "$(os_name)" == Darwin ]]; then
-    say "If macOS asks for clipboard or network permission, allow it."
-    say "Open a new terminal if the 'pastebridge' command is not found yet."
+    say "Allow clipboard / network permission if macOS asks."
   fi
 }
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -23,7 +23,7 @@ use crate::identity::{Identity, PeerList};
 use crate::sync::{self, IncomingClip, OutgoingClip};
 use crate::tls::{self, peer_cert, PinStore};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub running: bool,
     pub pid: u32,
@@ -37,7 +37,7 @@ pub struct Status {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub device_id: String,
     pub name: String,

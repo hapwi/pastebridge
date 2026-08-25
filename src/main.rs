@@ -65,7 +65,7 @@ async fn real_main() -> Result<()> {
 
     match cli.command {
         None => {
-            print_intro(&cfg, &paths, &identity);
+            print_intro(&paths, &identity);
             Ok(())
         }
         Some(Command::Start) => daemon::run(cfg, paths, identity).await,
@@ -79,55 +79,52 @@ async fn real_main() -> Result<()> {
     }
 }
 
-fn print_intro(cfg: &Config, paths: &Paths, identity: &Identity) {
+fn print_intro(paths: &Paths, identity: &Identity) {
     println!("pastebridge {}", env!("CARGO_PKG_VERSION"));
     println!();
-    println!(
-        "  This computer : {} ({})",
-        identity.name, identity.device_id
-    );
-    println!("  Config        : {}", paths.config_dir.display());
-    println!();
+    println!("  {}", identity.name);
 
     let peers = PeerList::load(paths).unwrap_or_default();
     if peers.peers.is_empty() {
-        println!("  Not paired yet. On both computers run:");
-        println!();
-        println!("      pastebridge pair");
-        println!();
-        println!("  Compare the codes, type y, then:");
-        println!();
-        println!("      pastebridge install-service");
+        println!("  not paired — pastebridge pair");
     } else {
-        println!("  Paired with:");
         for peer in &peers.peers {
-            println!("      {} ({})", peer.name, peer.device_id);
+            println!("  {}", peer.name);
         }
-        println!();
-        if daemon::running_pid(paths).is_some() {
-            println!("  Daemon is running. Copy here, paste there.");
-        } else {
-            println!("  Daemon is not running. Start it with:");
-            println!();
-            println!("      pastebridge start");
-            println!("      pastebridge install-service");
+        if daemon::running_pid(paths).is_none() {
+            println!("  daemon stopped — pastebridge start");
         }
     }
     println!();
-    println!("  Commands: pair, start, status, doctor, install-service");
-    println!("  Port {}  (UDP, QUIC)", cfg.port);
 }
 
 fn print_status(paths: &Paths, identity: &Identity) -> Result<()> {
-    if let Ok(text) = std::fs::read_to_string(&paths.status_file) {
-        if daemon::running_pid(paths).is_some() {
-            println!("{text}");
-            return Ok(());
+    println!();
+    println!("  {}", identity.name);
+    if daemon::running_pid(paths).is_none() {
+        println!("  daemon     stopped");
+    } else if let Ok(text) = std::fs::read_to_string(&paths.status_file) {
+        if let Ok(status) = serde_json::from_str::<daemon::Status>(&text) {
+            println!("  daemon     running");
+            for peer in status.peers {
+                let state = if peer.connected {
+                    "connected"
+                } else {
+                    "waiting"
+                };
+                println!("  {:<10} {state}", peer.name);
+            }
+            if let Some(err) = status.last_error {
+                println!("! error      {err}");
+            }
+        } else {
+            println!("  daemon     running");
         }
+    } else {
+        println!("  daemon     running");
     }
-    println!("daemon: stopped");
-    println!("device: {} ({})", identity.name, identity.device_id);
-    print_list(paths)
+    println!();
+    Ok(())
 }
 
 fn print_list(paths: &Paths) -> Result<()> {

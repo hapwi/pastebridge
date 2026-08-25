@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{parse_addr, Config, Paths};
 use crate::crypto::{device_id_from_cert, sas_code};
@@ -17,6 +17,7 @@ use crate::discovery::{self, TailscaleNetwork, PAIR_SERVICE};
 use crate::identity::{Identity, Peer, PeerList};
 use crate::protocol::{self, Msg, PROTO};
 use crate::tls::{self, peer_cert};
+use crate::ui;
 
 pub async fn run(
     cfg: &Config,
@@ -41,23 +42,17 @@ pub async fn run(
     } else {
         discovery::start_mdns().ok()
     };
-    let advertised = if let Some(mdns) = mdns.as_ref() {
-        match discovery::advertise(
+    if let Some(mdns) = mdns.as_ref() {
+        if let Err(err) = discovery::advertise(
             mdns,
             PAIR_SERVICE,
             &identity.device_id,
             &identity.name,
             cfg.pair_port,
         ) {
-            Ok(_) => true,
-            Err(err) => {
-                warn!("mDNS advertise failed: {err}");
-                false
-            }
+            warn!("mDNS advertise failed: {err}");
         }
-    } else {
-        false
-    };
+    }
 
     let client_cfg = tls::pairing_client(identity)?;
     let (endpoint, client_endpoint) = if connecting {
@@ -77,57 +72,29 @@ pub async fn run(
     };
 
     println!();
-    println!("  Device : {} ({})", identity.name, identity.device_id);
-    if !connecting {
-        println!("  Listen : {}:{}", cfg.bind_address, cfg.pair_port);
-    }
-    if advertised {
-        println!("  LAN    : advertising via mDNS");
-    }
-    if let Some(network) = tailscale.as_ref() {
-        let desktop: Vec<_> = network.pairable_peers().collect();
-        println!(
-            "  Tailnet: {} ({} desktop peer{})",
-            network.local_ip,
-            desktop.len(),
-            if desktop.len() == 1 { "" } else { "s" }
-        );
-        for peer in desktop {
-            println!("           {} ({})", peer.ip, peer.name);
-        }
-    }
-    if !connecting {
-        println!();
-        println!("  On the other computer, run the same command:");
-        println!("      pastebridge pair");
-        if tailscale.is_none() {
-            println!();
-            println!("  For another network, install and start Tailscale on both computers");
-            println!(
-                "  or use: pastebridge pair --connect <address>:{}",
-                cfg.pair_port
-            );
-        }
-        println!();
-        println!("  Waiting for the other computer…  (Ctrl+C to cancel)");
-        println!();
-    }
+    println!("  {}", identity.name);
 
     let our_id = identity.device_id.clone();
+    let looking = ui::spinner("waiting for the other computer");
     let conn = if let Some(target) = connect {
+        looking.set_message(format!("connecting to {target}"));
         let addr = resolve_addr(&target, cfg.pair_port)?;
-        println!("  Connecting to {addr}…");
-        connect_to(&client_endpoint, addr).await?
+        let conn = connect_to(&client_endpoint, addr).await;
+        ui::stop(looking);
+        conn?
     } else {
-        wait_for_peer(
+        let conn = wait_for_peer(
             &endpoint,
             &client_endpoint,
             mdns.as_ref(),
             &our_id,
             cfg.pair_port,
             tailscale,
+            &looking,
         )
-        .await?
+        .await;
+        ui::stop(looking);
+        conn?
     };
 
     let peer_der = peer_cert(&conn)?;
@@ -173,14 +140,11 @@ pub async fn run(
     }
 
     println!();
-    println!("  Found  : {peer_name} ({peer_id})");
+    println!("  {peer_name}");
     println!();
-    println!("  ┌─────────────────────┐");
-    println!("  │  Code  {sas}  │");
-    println!("  └─────────────────────┘");
+    println!("     {sas}");
     println!();
-    println!("  Look at the other screen. The codes must match.");
-    print!("  Pair this computer with {peer_name}? [y/N] ");
+    print!("  codes match? [y/N] ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let answer = tokio::task::spawn_blocking(|| {
         let mut line = String::new();
@@ -197,11 +161,10 @@ pub async fn run(
     }
 
     protocol::write_msg(&mut send, &Msg::PairConfirm).await?;
-    println!("  Waiting for the other computer to confirm…");
-
-    let reply = tokio::time::timeout(Duration::from_secs(90), protocol::read_msg(&mut recv))
-        .await
-        .context("timed out waiting for the other computer to confirm")??;
+    let waiting = ui::spinner(format!("waiting for {peer_name}"));
+    let reply = tokio::time::timeout(Duration::from_secs(90), protocol::read_msg(&mut recv)).await;
+    ui::stop(waiting);
+    let reply = reply.context("timed out waiting for the other computer to confirm")??;
 
     match reply {
         Msg::PairConfirm => {}
@@ -221,12 +184,10 @@ pub async fn run(
     });
     peers.save(paths)?;
 
-    println!();
-    println!("  Paired with {peer_name}.");
-    println!("  Start the daemon on both computers:");
-    println!("      pastebridge start");
-    println!("  Or install so it starts when you log in:");
-    println!("      pastebridge install-service");
+    println!("  paired with {peer_name}");
+    if crate::daemon::running_pid(paths).is_none() {
+        println!("  start syncing with  pastebridge start");
+    }
     println!();
 
     let _ = mdns;
@@ -284,7 +245,9 @@ async fn wait_for_peer(
     our_id: &str,
     pair_port: u16,
     tailscale: Option<TailscaleNetwork>,
+    looking: &indicatif::ProgressBar,
 ) -> Result<Connection> {
+    let looking = looking.clone();
     let (tx, mut rx) = mpsc::channel::<Connection>(8);
     let selected = Arc::new(AtomicBool::new(false));
     let targets: Arc<Mutex<HashMap<SocketAddr, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -327,6 +290,7 @@ async fn wait_for_peer(
             let our_id = our_id.to_string();
             let targets = targets.clone();
             let selected = selected.clone();
+            let looking = looking.clone();
             tokio::spawn(async move {
                 while let Some(found) = browse.recv().await {
                     if selected.load(Ordering::Acquire) {
@@ -335,7 +299,7 @@ async fn wait_for_peer(
                     if found.device_id == our_id {
                         continue;
                     }
-                    println!("  Found {} on the LAN at {}", found.name, found.addr);
+                    looking.set_message(format!("found {} on the LAN", found.name));
                     if let Ok(mut guard) = targets.lock() {
                         guard
                             .entry(found.addr)
@@ -377,6 +341,7 @@ async fn wait_for_peer(
     let dial_selected = selected.clone();
     let dial_targets = targets;
     let dial_id = our_id.to_string();
+    let dial_looking = looking;
     tokio::spawn(async move {
         let mut announced = HashMap::new();
         let mut warmed = HashMap::new();
@@ -394,7 +359,7 @@ async fn wait_for_peer(
             let mut attempts = tokio::task::JoinSet::new();
             for (addr, name) in addrs {
                 if announced.insert(addr, name.clone()).is_none() {
-                    println!("  Trying {name} at {addr}…");
+                    dial_looking.set_message(format!("trying {name}"));
                     if let std::net::IpAddr::V4(ip) = addr.ip() {
                         if warmed.insert(ip, ()).is_none() {
                             tokio::task::spawn_blocking(move || discovery::tailscale_ping(ip));
@@ -428,8 +393,8 @@ async fn wait_for_peer(
                             offer_connection(conn, true, &our_id, tx, selected).await;
                         });
                     }
-                    Ok(Err(err)) => warn!("connect to {name} ({addr}) failed: {err}"),
-                    Err(_) => warn!("connect to {name} ({addr}) timed out"),
+                    Ok(Err(err)) => debug!("connect to {name} ({addr}) failed: {err}"),
+                    Err(_) => debug!("connect to {name} ({addr}) timed out"),
                 }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;

@@ -128,11 +128,7 @@ pub fn tailscale_ping(ip: Ipv4Addr) {
     let Some(binary) = tailscale_binary() else {
         return;
     };
-    let _ = command_output_limited(
-        &binary,
-        &["ping", "-c", "1", &ip.to_string()],
-        32 * 1024,
-    );
+    let _ = command_output_limited(&binary, &["ping", "-c", "1", &ip.to_string()], 32 * 1024);
 }
 
 pub fn advertise(
@@ -267,10 +263,7 @@ fn parse_tailscale_status(bytes: &[u8], local_ip: Ipv4Addr) -> Result<TailscaleN
 
 pub fn is_pairable_os(os: &str) -> bool {
     let os = os.to_ascii_lowercase();
-    !(os.contains("ios")
-        || os.contains("android")
-        || os.contains("tvos")
-        || os.contains("watchos"))
+    !(os.contains("ios") || os.contains("android") || os.contains("tvos") || os.contains("watchos"))
 }
 
 fn command_output_limited(binary: &Path, args: &[&str], max_bytes: usize) -> Result<Vec<u8>> {
