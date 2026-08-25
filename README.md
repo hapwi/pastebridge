@@ -1,90 +1,92 @@
 # Pastebridge
 
-Copy on a Mac, paste on Linux. Copy on Linux, paste on a Mac.
+**Universal Clipboard for Mac and Linux — without the cloud.**
 
-No account, no cloud, no extra window. Pair the two computers once. After that it behaves like Apple’s Universal Clipboard: the normal copy and paste shortcuts, on both operating systems.
+Copy on your Mac, paste on Linux. Copy on Linux, paste on your Mac. Pastebridge syncs your clipboard between computers over your local network or Tailscale, using the same shortcuts you already know. No account, no cloud upload, no extra window.
 
-## Install
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](https://github.com/hapwi/pastebridge/releases)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange)](https://www.rust-lang.org/)
 
-On macOS or Linux:
+---
+
+## Why Pastebridge
+
+| | |
+|---|---|
+| **Feels native** | Works like Apple's Universal Clipboard — `⌘C` / `⌘V` on macOS, `Ctrl+C` / `Ctrl+V` on Linux |
+| **Stays local** | Traffic never leaves your LAN or VPN. No server to run, no account to create |
+| **Pair once** | Confirm an 8-digit code on both machines. After that, sync runs in the background |
+| **Private by design** | TLS 1.3 with pinned certificates, password-manager clipboards blocked, no history on disk |
+| **Zero friction** | One-line install, background login service, automatic discovery over mDNS and Tailscale |
+
+---
+
+## Quick start
+
+**1. Install** on macOS or Linux:
 
 ```bash
 curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
 ```
 
-That downloads a prebuilt binary and enables the user-level login service.
-Rust is not required.
+Downloads a prebuilt binary and enables the user-level login service. Rust is not required.
 
-Then pair both computers:
-
-```bash
-pastebridge pair
-```
-
-Compare the 8-digit codes. If they match, type `y` on both.
-
-After pairing, the already-installed login service reloads the peer and begins
-syncing automatically.
-
-Linux users on Wayland should have `wl-clipboard` (the installer tries to add it). On macOS, allow clipboard / local network permission if the OS asks.
-
-## Pair
-
-1. On computer A: `pastebridge pair`
-2. On computer B: `pastebridge pair`
-3. Both screens show an 8-digit code. If the codes match, type `y` on both.
-
-The code is computed from the TLS certificates. A machine in the middle would show a *different* code, so do not confirm if they disagree.
-
-If Tailscale is installed, running, and logged into the same tailnet on both
-computers, run the same command on both:
+**2. Pair** both computers:
 
 ```bash
 pastebridge pair
 ```
 
-Pastebridge reads `tailscale status --json` and `tailscale ip -4` directly,
-discovers online desktop peers on the tailnet, and keeps LAN mDNS as a fallback.
-It skips phones and other mobile Tailscale nodes. It does not change Tailscale
-settings or bypass tailnet policy.
+Both screens show an 8-digit code derived from the TLS certificates. If the codes match, type `y` on both. A machine in the middle would show a *different* code — do not confirm if they disagree.
 
-After pairing, the daemon automatically retries saved LAN addresses and current
-Tailscale addresses. Both computers still need to be online, Pastebridge and
-Tailscale must be running, and UDP 27419/27420 must be allowed by host firewalls
-and the tailnet ACL.
+**3. Use it.** Copy text or a screenshot on one machine. Paste on the other with your usual shortcut.
 
-## Use
+> **Linux (Wayland):** Install `wl-clipboard` — the installer tries to add it automatically.  
+> **macOS:** Allow clipboard and local network access if the OS prompts you.
 
-Copy text or a screenshot on one computer. Paste on the other with the usual shortcut.
-Remotely received text and images are cleared after 3 minutes by default, but
-only if the clipboard still contains that exact item. Copying or editing
-anything newer leaves the clipboard untouched.
+---
 
-```
+## How it works
+
+Pastebridge runs as a background daemon on each machine. When you copy, the daemon sends the clipboard payload to paired peers over encrypted QUIC (UDP). Discovery uses mDNS on the LAN; if [Tailscale](https://tailscale.com/) is installed, running, and logged into the same tailnet on both computers, Pastebridge also discovers desktop peers via `tailscale status` and keeps LAN mDNS as a fallback. Phones and other mobile Tailscale nodes are skipped.
+
+After pairing, the daemon automatically retries saved LAN addresses and current Tailscale addresses. Both computers must be online, Pastebridge and Tailscale (if used) must be running, and **UDP 27419** (sync) and **UDP 27420** (pairing) must be allowed by host firewalls and tailnet ACLs.
+
+Remotely received text and images expire after **3 minutes** by default, but only if the clipboard still contains that exact item. Copying or editing anything newer leaves the clipboard untouched.
+
+---
+
+## Commands
+
+```bash
 pastebridge status          # is it running? who is connected?
-pastebridge doctor          # clipboard, ports, pairing
+pastebridge doctor          # clipboard, ports, pairing diagnostics
+pastebridge update          # check for a newer release and install
 pastebridge list            # paired devices
 pastebridge unpair <id>     # forget a device
 ```
 
-## How it stays private
+`pastebridge update` checks GitHub for a newer version, shows `0.1.1 → 0.1.2`, and asks `update? [y/N]` before replacing the binary. Pass `-y` to skip the prompt. If the login service is running, it restarts onto the new build.
 
-- After pairing, every connection is QUIC (TLS 1.3) with **pinned certificates**. An unknown machine on the LAN cannot join.
-- Password-manager clipboards marked concealed (macOS `org.nspasteboard.ConcealedType`, KDE password hints) are not sent.
-- On Linux, Pastebridge refuses to sync when the active clipboard backend cannot expose concealment metadata. Install `wl-clipboard` on Wayland or `xclip` on X11.
-- Clipboard history is not written to disk.
-- An unchanged remotely received clipboard is cleared after 180 seconds by default. Local clipboard items are not expired.
-- There is no server to run and no account to create. Traffic stays on your LAN, or on a VPN you already trust such as Tailscale.
+---
 
-Clipboard history managers can retain or restore an item after Pastebridge
-clears the system clipboard. Pastebridge cannot delete entries from a separate
-clipboard manager's history. Clipboard APIs also do not provide a portable
-atomic compare-and-clear operation, so Pastebridge compares the exact type and
-bytes immediately before clearing.
+## Security & privacy
 
-Default ports: **UDP 27419** (sync) and **UDP 27420** (pairing). mDNS uses UDP 5353.
+- **Encrypted & authenticated** — Every connection uses QUIC with TLS 1.3 and pinned certificates. An unknown machine on the LAN cannot join.
+- **Sensitive clipboards blocked** — Password-manager clipboards marked concealed (macOS `org.nspasteboard.ConcealedType`, KDE password hints) are never sent.
+- **Safe backends only** — On Linux, Pastebridge refuses to sync when the active clipboard backend cannot expose concealment metadata. Use `wl-clipboard` on Wayland or `xclip` on X11.
+- **Nothing on disk** — Clipboard history is not written to disk.
+- **Auto-expiry** — Unchanged remotely received clipboards are cleared after 180 seconds by default. Local clipboard items are not expired.
+- **Your network, your rules** — No central server. Traffic stays on your LAN or a VPN you already trust.
 
-## Config
+> Clipboard history managers can retain or restore an item after Pastebridge clears the system clipboard. Pastebridge cannot delete entries from a separate manager's history. Clipboard APIs also do not provide a portable atomic compare-and-clear operation, so Pastebridge compares the exact type and bytes immediately before clearing.
+
+Default ports: **UDP 27419** (sync), **UDP 27420** (pairing), **UDP 5353** (mDNS).
+
+---
+
+## Configuration
 
 `~/.config/pastebridge/config.toml` on Linux  
 `~/Library/Application Support/pastebridge/config.toml` on macOS
@@ -102,13 +104,11 @@ clipboard_ttl_seconds = 180
 static_peers = ["100.64.0.2:27419"]
 ```
 
-`bind_address = "0.0.0.0"` is required for automatic LAN and Tailscale
-connectivity. Set a specific address only when you intentionally want to limit
-Pastebridge to one interface.
+`bind_address = "0.0.0.0"` is required for automatic LAN and Tailscale connectivity. Set a specific address only when you intentionally want to limit Pastebridge to one interface.
 
-Set `clipboard_ttl_seconds = 0` to keep remote clipboard items indefinitely, or
-set another number of seconds up to one year. Restart the Pastebridge service
-after changing the configuration.
+Set `clipboard_ttl_seconds = 0` to keep remote clipboard items indefinitely, or another value up to one year. Restart the Pastebridge service after changing configuration.
+
+---
 
 ## Uninstall
 
@@ -119,6 +119,8 @@ rm -rf ~/.config/pastebridge
 # macOS:
 # rm -rf ~/Library/Application\ Support/pastebridge
 ```
+
+---
 
 ## License
 
