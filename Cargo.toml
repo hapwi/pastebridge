@@ -1,0 +1,56 @@
+[package]
+name = "pastebridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Copy on macOS, paste on Linux — and the other way. Local, encrypted, no account."
+license = "MIT"
+readme = "README.md"
+keywords = ["clipboard", "sync", "wayland", "macos", "p2p"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/hapwi/pastebridge"
+homepage = "https://github.com/hapwi/pastebridge"
+authors = ["Pastebridge contributors"]
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+hex = "0.4"
+hostname = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+local-ip-address = "0.6"
+mdns-sd = "0.13"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+rand = "0.8"
+rcgen = { version = "0.13", features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tempfile = "3"
