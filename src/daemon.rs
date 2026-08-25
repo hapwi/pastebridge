@@ -56,6 +56,7 @@ struct SessionConnector {
 }
 
 pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
+    crate::clipboard::wait_for_display();
     let pid_file = lock_pid(&paths)?;
     let _pid_guard = PidGuard {
         _file: pid_file,

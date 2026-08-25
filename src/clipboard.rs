@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use arboard::{Clipboard as Arboard, ImageData};
 use image::{ImageBuffer, ImageFormat, ImageReader, RgbaImage};
 use std::borrow::Cow;
+use std::fs;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -49,6 +50,7 @@ pub struct Clipboard {
 
 impl Clipboard {
     pub fn open() -> Result<Self> {
+        apply_wayland_env();
         let inner = Arboard::new().ok();
         let backend = detect_backend(inner.is_some());
         Ok(Self {
@@ -493,8 +495,102 @@ fn has_cmd(name: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
 }
 
+/// Wait until a Wayland compositor is reachable. systemd user services can
+/// start at login before niri/GNOME exports `WAYLAND_DISPLAY`.
+pub fn wait_for_display() {
+    #[cfg(target_os = "linux")]
+    {
+        if apply_wayland_env() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(250));
+            if apply_wayland_env() {
+                return;
+            }
+        }
+    }
+}
+
+fn apply_wayland_env() -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    match discover_wayland_socket(None) {
+        Some(display) => {
+            std::env::set_var("WAYLAND_DISPLAY", &display);
+            true
+        }
+        None => false,
+    }
+}
+
+fn wayland_display() -> Option<String> {
+    match std::env::var("WAYLAND_DISPLAY") {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => discover_wayland_socket(None),
+    }
+}
+
 fn is_wayland() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
+    wayland_display().is_some()
+}
+
+fn discover_wayland_socket(runtime_dir: Option<&Path>) -> Option<String> {
+    let runtime = runtime_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))?;
+    let mut found = Vec::new();
+    for entry in fs::read_dir(&runtime).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_wayland_socket_name(name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if !file_type.is_socket() {
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file_type;
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        found.push((modified, name.to_string()));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, name)| name).next()
+}
+
+fn is_wayland_socket_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("wayland-") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn wl_cmd(bin: &str) -> Option<Command> {
+    if !is_wayland() || !has_cmd(bin) {
+        return None;
+    }
+    let mut command = Command::new(bin);
+    if let Some(display) = wayland_display() {
+        command.env("WAYLAND_DISPLAY", display);
+    }
+    Some(command)
 }
 
 fn rgba_to_png(width: usize, height: usize, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -532,9 +628,6 @@ fn validate_image_size(width: usize, height: usize) -> Result<()> {
 }
 
 fn wl_paste_text() -> Option<String> {
-    if !is_wayland() || !has_cmd("wl-paste") {
-        return None;
-    }
     for mime in [
         "text/plain",
         "text/plain;charset=utf-8",
@@ -542,7 +635,7 @@ fn wl_paste_text() -> Option<String> {
         "STRING",
         "UTF8_STRING",
     ] {
-        let mut command = Command::new("wl-paste");
+        let mut command = wl_cmd("wl-paste")?;
         command.args(["-t", mime, "--no-newline"]);
         if let Some(bytes) = read_command_output(command, MAX_PAYLOAD_BYTES) {
             if let Some(text) = decode_clipboard_bytes(&bytes) {
@@ -557,11 +650,8 @@ fn wl_paste_text() -> Option<String> {
 }
 
 fn wl_paste_image() -> Option<Vec<u8>> {
-    if !is_wayland() || !has_cmd("wl-paste") {
-        return None;
-    }
     for mime in IMAGE_PASTE_MIMES {
-        let mut command = Command::new("wl-paste");
+        let mut command = wl_cmd("wl-paste")?;
         command.args(["-t", mime]);
         let Some(output) = read_command_output(command, MAX_PAYLOAD_BYTES) else {
             continue;
@@ -582,10 +672,7 @@ fn wl_paste_image() -> Option<Vec<u8>> {
 }
 
 fn wl_paste_file_paths() -> Option<Vec<PathBuf>> {
-    if !is_wayland() || !has_cmd("wl-paste") {
-        return None;
-    }
-    let mut command = Command::new("wl-paste");
+    let mut command = wl_cmd("wl-paste")?;
     command.args(["-t", "x-special/gnome-copied-files"]);
     if let Some(output) = read_command_output(command, 64 * 1024) {
         if let Some(text) = decode_clipboard_bytes(&output) {
@@ -595,7 +682,7 @@ fn wl_paste_file_paths() -> Option<Vec<PathBuf>> {
             }
         }
     }
-    let mut command = Command::new("wl-paste");
+    let mut command = wl_cmd("wl-paste")?;
     command.args(["-t", "text/uri-list"]);
     let output = read_command_output(command, 64 * 1024)?;
     let text = decode_clipboard_bytes(&output)?;
@@ -604,10 +691,8 @@ fn wl_paste_file_paths() -> Option<Vec<PathBuf>> {
 }
 
 fn wl_copy_text(text: &str) -> Result<()> {
-    if !is_wayland() || !has_cmd("wl-copy") {
-        anyhow::bail!("no wl-copy");
-    }
-    let mut child = Command::new("wl-copy")
+    let mut child = wl_cmd("wl-copy")
+        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -624,10 +709,8 @@ fn wl_copy_text(text: &str) -> Result<()> {
 }
 
 fn wl_copy_image(png: &[u8]) -> Result<()> {
-    if !is_wayland() || !has_cmd("wl-copy") {
-        anyhow::bail!("no wl-copy");
-    }
-    let mut child = Command::new("wl-copy")
+    let mut child = wl_cmd("wl-copy")
+        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
         .args(["-t", "image/png"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -645,10 +728,8 @@ fn wl_copy_image(png: &[u8]) -> Result<()> {
 }
 
 fn wl_clear() -> Result<()> {
-    if !is_wayland() || !has_cmd("wl-copy") {
-        anyhow::bail!("no wl-copy");
-    }
-    let status = Command::new("wl-copy")
+    let status = wl_cmd("wl-copy")
+        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
         .arg("--clear")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -846,8 +927,7 @@ fn is_concealed() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_concealed() -> bool {
-    let command = if is_wayland() && has_cmd("wl-paste") {
-        let mut command = Command::new("wl-paste");
+    let command = if let Some(mut command) = wl_cmd("wl-paste") {
         command.arg("--list-types");
         command
     } else if !is_wayland() && has_cmd("xclip") {
@@ -1035,5 +1115,27 @@ mod tests {
         let pdf = dir.path().join("notes.pdf");
         std::fs::write(&pdf, b"%PDF").unwrap();
         assert!(png_from_single_image_file(&[pdf]).is_none());
+    }
+
+    #[test]
+    fn wayland_socket_names_are_numeric() {
+        assert!(super::is_wayland_socket_name("wayland-0"));
+        assert!(super::is_wayland_socket_name("wayland-1"));
+        assert!(!super::is_wayland_socket_name("wayland-1.lock"));
+        assert!(!super::is_wayland_socket_name("pulse"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_wayland_socket_in_runtime_dir() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("wayland-1");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        std::fs::write(dir.path().join("wayland-1.lock"), b"").unwrap();
+        assert_eq!(
+            super::discover_wayland_socket(Some(dir.path())).as_deref(),
+            Some("wayland-1")
+        );
     }
 }

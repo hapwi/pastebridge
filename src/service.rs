@@ -71,8 +71,9 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     let unit = format!(
         "[Unit]\n\
          Description=Pastebridge clipboard sync\n\
-         After=network-online.target\n\
+         After=graphical-session-pre.target network-online.target\n\
          Wants=network-online.target\n\
+         PartOf=graphical-session.target\n\
          \n\
          [Service]\n\
          ExecStart={exe} start\n\
@@ -85,9 +86,12 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
          RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n",
+         WantedBy=graphical-session.target\n",
         exe = exe.display()
     );
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "pastebridge.service"])
+        .status();
     fs::write(&path, unit)?;
 
     let _ = Command::new("systemctl")
