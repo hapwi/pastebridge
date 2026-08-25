@@ -4,7 +4,7 @@ repository = { repo = "hapwi/pastebridge", provider = "github" }
 homepage = "https://github.com/hapwi/pastebridge"
 
 [package.metadata.deb]
-maintainer = "Pastebridge contributors"
+maintainer = "hapwi"
 copyright = "2026"
 extended-description = "Copy on macOS, paste on Linux. Local encrypted clipboard sync."
 depends = "$auto"

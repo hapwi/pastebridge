@@ -10,7 +10,7 @@ keywords = ["clipboard", "sync", "wayland", "macos", "p2p"]
 categories = ["command-line-utilities"]
 repository = "https://github.com/hapwi/pastebridge"
 homepage = "https://github.com/hapwi/pastebridge"
-authors = ["Pastebridge contributors"]
+authors = ["hapwi"]
 
 [dependencies]
 anyhow = "1"
