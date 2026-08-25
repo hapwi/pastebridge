@@ -96,11 +96,10 @@ pub fn run(yes: bool, paths: &Paths) -> Result<()> {
     }
 
     replace_binary(&extracted)?;
-    if let Err(err) = crate::macos_identity::prepare_executable(
-        &std::env::current_exe()?.canonicalize()?,
-        &paths.config_dir,
-    ) {
-        tracing::warn!("could not keep macOS permissions across this update: {err}");
+    if let Err(err) =
+        crate::macos_identity::prepare_executable(&std::env::current_exe()?.canonicalize()?)
+    {
+        tracing::warn!("could not clear macOS quarantine after update: {err}");
     }
     if crate::daemon::running_pid(paths).is_some() {
         let _ = crate::service::restart();

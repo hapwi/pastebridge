@@ -176,10 +176,8 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
         logs = logs.display()
     );
     fs::write(&path, plist)?;
-    if let Err(err) =
-        crate::macos_identity::prepare_executable(exe, &crate::config::Paths::new()?.config_dir)
-    {
-        tracing::warn!("could not keep macOS permissions on this binary: {err}");
+    if let Err(err) = crate::macos_identity::prepare_executable(exe) {
+        tracing::warn!("could not clear macOS quarantine on this binary: {err}");
     }
     let uid = Command::new("id").arg("-u").output()?;
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();

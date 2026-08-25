@@ -37,6 +37,22 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Import hapwi signing cert
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SELFSIGN_P12_BASE64: ${{ secrets.MACOS_SELFSIGN_P12_BASE64 }}
+          MACOS_SELFSIGN_P12_PASSWORD: ${{ secrets.MACOS_SELFSIGN_P12_PASSWORD }}
+        run: bash scripts/macos-import-cert.sh
+      - name: Codesign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          BIN="target/${{ matrix.target }}/release/pastebridge"
+          codesign --force --sign "hapwi Pastebridge" \
+            --identifier com.hapwi.pastebridge \
+            --timestamp=none \
+            "$BIN"
+          codesign --verify --verbose=2 "$BIN"
+          codesign -dv --verbose=4 "$BIN" 2>&1 | grep -E 'Authority|Identifier'
       - name: Package
         run: |
           mkdir -p dist

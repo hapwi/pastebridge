@@ -6,5 +6,7 @@
 *.swo
 .DS_Store
 .env
+*.p12
+*.p12.b64
 identity.json
 peers.json

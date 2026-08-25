@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key>
-  <string>dev.pastebridge.pastebridge</string>
+  <string>com.hapwi.pastebridge</string>
   <key>CFBundleName</key>
   <string>Pastebridge</string>
   <key>CFBundlePackageType</key>
