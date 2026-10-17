@@ -71,6 +71,14 @@ say() {
   printf '%s\n' "$*"
 }
 
+step() {
+  printf '  → %s\n' "$*"
+}
+
+done_step() {
+  printf '  ✓ %s\n' "$*"
+}
+
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -137,11 +145,11 @@ ensure_local_bin_path() {
     mkdir -p "$(dirname "$rc")"
     if ! grep -Fqx "$line" "$rc" 2>/dev/null; then
       printf '\n# pastebridge\n%s\n' "$line" >> "$rc"
-      say "Added $bin_dir to PATH in $rc"
     fi
   done
   export PATH="$bin_dir:$PATH"
-  say "Open a new terminal to use the pastebridge command. Setup continues here."
+  done_step "Terminal command configured"
+  say "  Open a new terminal to use the pastebridge command. Setup continues here."
 }
 
 load_cargo_env() {
@@ -276,7 +284,7 @@ install_prebuilt() {
   resolve_release
   archive="pastebridge-${target}.tar.gz"
   WORK_DIR="$(mktemp -d)"
-  say "Downloading Pastebridge ${RELEASE_TAG#v} for ${target}..."
+  step "Download Pastebridge ${RELEASE_TAG#v} · ${target}"
   fetch "$RELEASE_BASE/$RELEASE_TAG/SHA256SUMS" "$WORK_DIR/SHA256SUMS" \
     || fail "could not download checksums; refusing an unverified installation"
   expected="$(awk -v name="$archive" '$2 == name || $2 == "*" name { print $1; exit }' "$WORK_DIR/SHA256SUMS")"
@@ -285,6 +293,7 @@ install_prebuilt() {
     || fail "could not download $archive; your existing installation has not changed"
   actual="$(file_sha256 "$WORK_DIR/$archive")"
   [[ "$expected" == "$actual" ]] || fail "checksum mismatch for $archive"
+  done_step "Download and checksum verified"
   tar -xzf "$WORK_DIR/$archive" -C "$WORK_DIR" pastebridge
   [[ -f "$WORK_DIR/pastebridge" && ! -L "$WORK_DIR/pastebridge" ]] \
     || fail "archive did not contain a regular pastebridge executable"
@@ -328,7 +337,12 @@ install_binary() {
 }
 
 main() {
-  say "Pastebridge"
+  say ""
+  if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
+    printf '  \033[1;36mPastebridge\033[0m  \033[2m/ Setup\033[0m\n\n'
+  else
+    printf '  Pastebridge / Setup\n\n'
+  fi
 
   [[ "$(os_name)" == Darwin || "$(os_name)" == Linux ]] \
     || fail "Pastebridge supports macOS and Linux"
@@ -345,6 +359,7 @@ main() {
   [[ -n "$INSTALLED_BIN" && -x "$INSTALLED_BIN" ]] \
     || fail "pastebridge did not install into $INSTALL_DIR"
 
+  step "Start the clipboard service"
   if ! "$INSTALLED_BIN" install-service; then
     fail "Pastebridge could not start its login service; check the diagnostics above"
   fi
@@ -354,24 +369,38 @@ main() {
   if [[ ( -e "$cargo_bin" || -L "$cargo_bin" ) && ! "$cargo_bin" -ef "$INSTALLED_BIN" ]]; then
     ln -sfn "$INSTALLED_BIN" "$cargo_bin"
   fi
-  say "Installed $INSTALLED_BIN and verified its login service."
+  done_step "Pastebridge is installed and ready"
+  say "  Starts automatically when you log in to your desktop."
+  say ""
   if [[ "$(os_name)" == Darwin ]]; then
-    say "Allow Local Network access if macOS asks."
+    say "  Allow Local Network access if macOS asks."
   fi
   local paired
-  paired="$("$INSTALLED_BIN" list)" || fail "could not read paired devices"
-  if [[ "$paired" == "no paired devices" && "${PASTEBRIDGE_NO_PAIR:-}" != 1 ]]; then
-    say "Run this installer on your other computer too. Compare the pairing code on both screens."
+  if ! paired="$("$INSTALLED_BIN" list --quiet 2>/dev/null)"; then
+    paired="$("$INSTALLED_BIN" list)" || fail "could not read paired devices"
+    [[ "$paired" != "no paired devices" ]] || paired=""
+  fi
+  if [[ -z "$paired" && "${PASTEBRIDGE_NO_PAIR:-}" != 1 ]]; then
+    say "  Next · pair your computers"
+    say "  Run this installer on your other computer too. Compare the code on both screens."
     if ( : </dev/tty ) 2>/dev/null; then
       "$INSTALLED_BIN" pair </dev/tty
     else
       say "Run $INSTALLED_BIN pair in an interactive terminal on both computers."
     fi
-  elif [[ "$paired" == "no paired devices" ]]; then
-    say "Next: $INSTALLED_BIN pair"
+  elif [[ -z "$paired" ]]; then
+    say "  Next: $INSTALLED_BIN pair"
   else
-    say "Your existing pairing is preserved. Pastebridge reconnects when the other computer is online."
+    done_step "Your saved computers are preserved"
+    "$INSTALLED_BIN" status
+    say "  Reinstalled another computer? Run pastebridge pair on both to pair it again."
   fi
+  say ""
+  say "  Open dashboard   pastebridge"
+  say "  Show computers   pastebridge devices"
+  say "  Forget computer  pastebridge unpair"
+  say "  Check updates    pastebridge update"
+  say ""
 }
 
 main "$@"

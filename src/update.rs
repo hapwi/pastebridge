@@ -32,23 +32,30 @@ struct Asset {
 }
 
 pub fn run(yes: bool, paths: &Paths) -> Result<()> {
-    let checking = ui::spinner("checking");
+    ui::heading("Update");
+    let checking = ui::spinner("Checking GitHub for the latest release…");
     let latest = latest_release();
     ui::stop(checking);
     let (version, release) = latest?;
 
-    println!();
     let current = parse_version(CURRENT).context("current version is not semver")?;
     if version <= current {
-        println!("  {CURRENT}");
-        println!("  up to date");
+        ui::success(format!("You’re up to date · {CURRENT}"));
+        ui::hint("Your saved computers and login service are unchanged.");
         println!();
         return Ok(());
     }
 
-    println!("  {CURRENT} → {version}");
+    println!(
+        "  {}  →  {}",
+        ui::muted(CURRENT),
+        ui::accent(&version.to_string())
+    );
+    ui::hint("Your saved computers and settings will be preserved.");
     println!();
     if !should_update(yes)? {
+        ui::hint("Update cancelled · nothing changed.");
+        println!();
         return Ok(());
     }
 
@@ -68,13 +75,14 @@ pub fn run(yes: bool, paths: &Paths) -> Result<()> {
 
     let tmp = TempDir::create()?;
     let archive_path = tmp.0.join(&archive);
-    let downloading = ui::spinner("downloading");
+    let downloading = ui::spinner(format!("Downloading Pastebridge {version}…"));
     let downloaded = curl_file(&asset.browser_download_url, &archive_path);
     ui::stop(downloading);
     downloaded?;
 
     let sums = String::from_utf8(curl_get(sums_url)?).context("invalid checksum manifest")?;
     verify_checksum(&archive_path, &sums, &archive)?;
+    ui::success("Download verified");
 
     let extracted = tmp.0.join("pastebridge");
     let status = Command::new("tar")
@@ -92,9 +100,15 @@ pub fn run(yes: bool, paths: &Paths) -> Result<()> {
     }
 
     verify_binary_version(&extracted, &version.to_string())?;
+    ui::success("New executable verified");
     let dest = std::env::current_exe()?.canonicalize()?;
     let was_running = crate::daemon::running_pid(paths).is_some();
-    activate_binary(
+    let activating = ui::spinner(if was_running {
+        "Installing and restarting the clipboard service…"
+    } else {
+        "Installing the update…"
+    });
+    let activated = activate_binary(
         &extracted,
         &dest,
         || {
@@ -116,9 +130,16 @@ pub fn run(yes: bool, paths: &Paths) -> Result<()> {
             }
             Ok(())
         },
-    )?;
+    );
+    ui::stop(activating);
+    activated?;
 
-    println!("  updated to {version}");
+    ui::success(format!("Updated to {version}"));
+    ui::hint(if was_running {
+        "Clipboard service ready · paired computers reconnect automatically."
+    } else {
+        "Start clipboard sharing: pastebridge install-service"
+    });
     println!();
     Ok(())
 }
@@ -130,7 +151,7 @@ fn should_update(yes: bool) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("not a terminal; pass -y to update");
     }
-    Ok(ui::confirm("update?"))
+    Ok(ui::confirm("Install this update?"))
 }
 
 fn latest_release() -> Result<(Version, Release)> {

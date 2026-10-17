@@ -100,20 +100,26 @@ Remotely received text and images expire after **3 minutes** by default, but onl
 ## Commands
 
 ```bash
+pastebridge                 # dashboard with an interactive action menu
 pastebridge status          # is it running? who is connected?
 pastebridge doctor          # clipboard, ports, pairing diagnostics
 pastebridge update          # check for a newer release and install
-pastebridge list            # paired devices
-pastebridge unpair <id>     # forget a device
+pastebridge devices         # saved devices, connection state, and short IDs
+pastebridge unpair          # choose a device and confirm removal
+pastebridge unpair "My Mac" # find a device by name (or use its short ID)
 ```
 
-`pastebridge update` checks GitHub for a newer version, shows the version change, and asks `update? [y/N]` before replacing the binary. Pass `-y` to skip the prompt. The update requires a matching checksum and verifies that the downloaded executable reports the requested version. If the daemon is running, the update restarts the login service and waits for that version to become ready. If activation fails, it restores the previous executable and attempts to restart the previous version.
+`pastebridge list` is an alias for `pastebridge devices`. Use `list --json` for device details without certificates, or `list --quiet` for device IDs only. The dashboard menu appears in interactive terminals; redirected output stays plain and never waits for input. Set `NO_COLOR=1` to turn off terminal colors.
+
+`pastebridge unpair` only removes the pairing on the current computer and stops its sharing with that device. Run it on the other computer too if you want to remove both saved entries. Names must match a single saved device; device IDs can be shortened to a unique prefix of at least four characters. Scripts must use `unpair <name-or-id> --yes`. Cancelling leaves the pairings unchanged.
+
+`pastebridge update` checks GitHub for a newer version, shows the version change, and asks for confirmation before replacing the binary. Pass `-y` to skip the prompt. The update requires a matching checksum and verifies that the downloaded executable reports the requested version. If the daemon is running, the update restarts the login service and waits for that version to become ready. If activation fails, it restores the previous executable and attempts to restart the previous version.
 
 `pastebridge status` distinguishes a ready daemon from a process that is starting or unhealthy. A peer is connected only after its application handshake completes. `pastebridge doctor` reports Tailscale login, permission, and timeout failures, and returns a nonzero exit status when a diagnostic check fails. An offline peer is normal and does not make the daemon unhealthy.
 
 ### Installer options
 
-Set `PASTEBRIDGE_RELEASE=v0.1.9` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
+Set `PASTEBRIDGE_RELEASE=v0.1.10` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
 
 Set `PASTEBRIDGE_NO_PAIR=1` to defer pairing. Set `PASTEBRIDGE_INSTALL_DIR` to choose a different binary directory. To build from source, use `PASTEBRIDGE_FROM_SOURCE=1` and install Rust and the platform build tools first.
 

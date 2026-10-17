@@ -25,6 +25,11 @@ pub async fn run(
     identity: &Identity,
     connect: Option<String>,
 ) -> Result<()> {
+    ui::heading("Pair a computer");
+    println!("  This computer  {}", ui::accent(&identity.name));
+    ui::hint("Run pastebridge pair on the other computer too.");
+    ui::hint("You will compare a code before clipboard sharing is allowed.");
+    println!();
     let connecting = connect.is_some();
     let tailscale = if connecting {
         None
@@ -70,9 +75,6 @@ pub async fn run(
         client_endpoint.set_default_client_config(client_cfg);
         (ep, client_endpoint)
     };
-
-    println!();
-    println!("  {}", identity.name);
 
     let our_id = identity.device_id.clone();
     let looking = ui::spinner("waiting for the other computer");
@@ -140,20 +142,15 @@ pub async fn run(
     }
 
     println!();
-    println!("  {peer_name}");
+    println!("  Pair with  {}", ui::accent(&peer_name));
+    ui::hint("Compare this code on both computers:");
     println!();
-    println!("     {sas}");
+    println!("     {}", ui::accent(&sas));
     println!();
-    print!("  codes match? [y/N] ");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    let answer = tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        line
-    })
-    .await
-    .unwrap_or_default();
-    let confirmed = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    ui::hint("Only confirm if the other screen shows the same code.");
+    let confirmed = tokio::task::spawn_blocking(|| ui::confirm("Do the codes match?"))
+        .await
+        .unwrap_or(false);
 
     if !confirmed {
         let _ = protocol::write_msg(&mut send, &Msg::PairAbort).await;
@@ -161,7 +158,7 @@ pub async fn run(
     }
 
     protocol::write_msg(&mut send, &Msg::PairConfirm).await?;
-    let waiting = ui::spinner(format!("waiting for {peer_name}"));
+    let waiting = ui::spinner(format!("Waiting for {peer_name} to confirm…"));
     let reply = tokio::time::timeout(Duration::from_secs(90), protocol::read_msg(&mut recv)).await;
     ui::stop(waiting);
     let reply = reply.context("timed out waiting for the other computer to confirm")??;
@@ -184,10 +181,13 @@ pub async fn run(
     });
     peers.save(paths)?;
 
-    println!("  paired with {peer_name}");
+    ui::success(format!("Paired with {peer_name}"));
     if crate::daemon::running_pid(paths).is_none() {
-        println!("  start syncing with  pastebridge start");
+        ui::hint("Start clipboard sharing: pastebridge install-service");
+    } else {
+        ui::hint("Connecting in the background. Check with pastebridge status.");
     }
+    ui::hint("Manage computers: pastebridge devices · pastebridge unpair");
     println!();
 
     let _ = mdns;

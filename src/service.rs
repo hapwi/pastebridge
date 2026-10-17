@@ -50,7 +50,7 @@ pub fn install() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         Duration::from_secs(45),
     )?;
-    println!("  login service enabled and ready");
+    crate::ui::success("Login service enabled and ready");
     Ok(())
 }
 
@@ -132,7 +132,7 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     );
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "pastebridge.service"])
-        .status();
+        .output();
     fs::write(&path, unit)?;
 
     let reload = Command::new("systemctl")
@@ -143,10 +143,13 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     }
     let enable = Command::new("systemctl")
         .args(["--user", "enable", "--now", "pastebridge.service"])
-        .status()
+        .output()
         .context("running systemctl")?;
-    if !enable.success() {
-        anyhow::bail!("could not enable the login service with systemctl --user");
+    if !enable.status.success() {
+        anyhow::bail!(
+            "could not enable the login service with systemctl --user: {}",
+            String::from_utf8_lossy(&enable.stderr).trim()
+        );
     }
     restart_systemd()
 }

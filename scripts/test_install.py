@@ -16,13 +16,16 @@ import unittest
 INSTALLER = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
 
 
-def binary(version="1.2.3", fail_service=False):
+def binary(version="1.2.3", fail_service=False, paired=False, legacy_list=False):
+    quiet_listing = "exit 2" if legacy_list else ("printf '0123456789abcdef\\n'" if paired else ":")
+    human_listing = "0123456789abcdef  Example Mac" if paired else "no paired devices"
     return f"""#!/bin/sh
 case "$1" in
   --version) printf 'pastebridge {version}\\n' ;;
   install-service) printf 'service {version}\\n' >> "$FIXTURE_LOG"; exit {int(fail_service)} ;;
   uninstall-service) printf 'uninstall\\n' >> "$FIXTURE_LOG" ;;
-  list) printf 'no paired devices\\n' ;;
+  list) if [ "$2" = --quiet ]; then {quiet_listing}; else printf '{human_listing}\\n'; fi ;;
+  status) printf 'Example Mac waiting\\n' ;;
   pair) printf 'pair\\n' >> "$FIXTURE_LOG" ;;
   *) exit 2 ;;
 esac
@@ -162,6 +165,23 @@ class InstallerTest(unittest.TestCase):
         executable = self.install_dir / "pastebridge"
         self.assertFalse(executable.is_symlink())
         self.assertEqual(executable.read_bytes(), binary())
+
+    def test_existing_pairings_are_shown_for_current_and_older_binaries(self):
+        for legacy_list in [False, True]:
+            with self.subTest(legacy_list=legacy_list):
+                self.release(payload=binary(paired=True, legacy_list=legacy_list))
+                result = self.run_installer()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Example Mac waiting", result.stdout)
+                self.assertIn("Reinstalled another computer?", result.stdout)
+                self.assertIn("pastebridge unpair", result.stdout)
+                self.assertNotIn("pair\n", self.log.read_text())
+
+    def test_older_binary_without_quiet_listing_still_shows_pairing_next_step(self):
+        self.release(payload=binary(legacy_list=True))
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Next:", result.stdout)
 
     def test_missing_or_invalid_checksums_leave_previous_install(self):
         executable = self.previous_install()
