@@ -46,7 +46,7 @@ No account. No cloud upload. No extra window.
 curl -fsSL https://raw.githubusercontent.com/hapwi/pastebridge/main/install.sh | bash
 ```
 
-Downloads a prebuilt binary for Apple Silicon or Intel macOS, or ARM64 or x86-64 Linux. The installer verifies its checksum and version, then enables the user-level login service and waits for the daemon to become ready. Rust, Bun, and Git are not required.
+Downloads a prebuilt binary for Apple Silicon macOS, or ARM64 or x86-64 Linux. Intel Macs are not supported. The installer verifies its checksum and version, then enables the user-level login service and waits for the daemon to become ready. Rust, Bun, and Git are not required.
 
 Pastebridge starts automatically **when you log in to your desktop**. It does not run before login. If a paired computer is off, Pastebridge keeps running and retries when that computer returns. Tailscale must also be connected when the computers are on different networks.
 
@@ -113,13 +113,13 @@ pastebridge unpair <id>     # forget a device
 
 ### Installer options
 
-Set `PASTEBRIDGE_RELEASE=v0.1.8` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
+Set `PASTEBRIDGE_RELEASE=v0.1.9` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
 
 Set `PASTEBRIDGE_NO_PAIR=1` to defer pairing. Set `PASTEBRIDGE_INSTALL_DIR` to choose a different binary directory. To build from source, use `PASTEBRIDGE_FROM_SOURCE=1` and install Rust and the platform build tools first.
 
 ### Release maintenance
 
-Release builds validate the project on Linux, Apple Silicon macOS, and Intel macOS before packaging all four supported targets. A `v*` tag must match `Cargo.toml`. Publishing creates a draft, uploads the complete binary set and checksums, then makes the release public. A failed draft publication can be retried. Published versioned assets are not overwritten. Pushes to `main` validate and build artifacts without changing the public release.
+Release builds validate the project on Linux and Apple Silicon macOS before packaging all three supported targets. A `v*` tag must match `Cargo.toml`. Publishing creates a draft, uploads the complete binary set and checksums, then makes the release public. A failed draft publication can be retried. Published versioned assets are not overwritten. Pushes to `main` validate and build artifacts without changing the public release.
 
 Run `python3 scripts/test_install.py` to exercise the piped installer against local HTTP fixtures. These checks use disposable homes and fake executables. They do not install a real login service or verify macOS permissions.
 

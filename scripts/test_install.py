@@ -88,7 +88,6 @@ class InstallerTest(unittest.TestCase):
             ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
             ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
             ("Darwin", "arm64"): "aarch64-apple-darwin",
-            ("Darwin", "x86_64"): "x86_64-apple-darwin",
         }[(os_name, arch)]
         payload = binary() if payload is None else payload
         output = io.BytesIO()
@@ -134,11 +133,25 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), str(self.install_dir / "pastebridge"))
 
     def test_selects_each_supported_platform(self):
-        for os_name, arch in [("Linux", "aarch64"), ("Darwin", "arm64"), ("Darwin", "x86_64")]:
+        for os_name, arch in [("Linux", "x86_64"), ("Linux", "aarch64"), ("Darwin", "arm64")]:
             with self.subTest(os_name=os_name, arch=arch):
                 self.release(os_name, arch)
                 result = self.run_installer()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_rejects_intel_mac_before_changing_previous_install(self):
+        executable = self.previous_install()
+        uname = self.tools / "uname"
+        uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; esac\n')
+        uname.chmod(0o755)
+        for from_source in ["0", "1"]:
+            with self.subTest(from_source=from_source):
+                self.env["PASTEBRIDGE_FROM_SOURCE"] = from_source
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires Apple Silicon", result.stderr)
+                self.assertEqual(executable.read_bytes(), binary("1.0.0"))
+                self.assertFalse(self.log.exists())
 
     def test_cargo_bin_can_also_be_the_install_directory(self):
         self.install_dir = self.home / ".cargo" / "bin"

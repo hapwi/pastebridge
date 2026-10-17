@@ -101,7 +101,6 @@ detect_target() {
     Linux-x86_64|Linux-amd64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
     Linux-aarch64|Linux-arm64) printf '%s\n' "aarch64-unknown-linux-gnu" ;;
     Darwin-arm64) printf '%s\n' "aarch64-apple-darwin" ;;
-    Darwin-x86_64) printf '%s\n' "x86_64-apple-darwin" ;;
     *) return 1 ;;
   esac
 }
@@ -333,6 +332,9 @@ main() {
 
   [[ "$(os_name)" == Darwin || "$(os_name)" == Linux ]] \
     || fail "Pastebridge supports macOS and Linux"
+  if [[ "$(os_name)" == Darwin && "$(uname -m)" != arm64 ]]; then
+    fail "Pastebridge requires Apple Silicon on macOS"
+  fi
 
   need_cmd curl || fail "curl is required"
   ensure_linux_clipboard
