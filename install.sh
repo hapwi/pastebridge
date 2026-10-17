@@ -121,8 +121,8 @@ ensure_local_bin_path() {
   if [[ ":$PATH:" == *":$bin_dir:"* ]]; then
     return
   fi
-  quoted="${bin_dir//\'/\'\\\'\'}"
-  line="export PATH='$quoted':\"\$PATH\""
+  quoted="$(printf '%s' "$bin_dir" | sed 's/[\\$`"]/\\&/g')"
+  line="$(printf 'export PATH="%s:$PATH"' "$quoted")"
   local profiles=()
   local shell_name="${SHELL:-/bin/sh}"
   case "${shell_name##*/}" in

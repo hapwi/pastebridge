@@ -113,7 +113,7 @@ pastebridge unpair <id>     # forget a device
 
 ### Installer options
 
-Set `PASTEBRIDGE_RELEASE=v0.1.7` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
+Set `PASTEBRIDGE_RELEASE=v0.1.8` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
 
 Set `PASTEBRIDGE_NO_PAIR=1` to defer pairing. Set `PASTEBRIDGE_INSTALL_DIR` to choose a different binary directory. To build from source, use `PASTEBRIDGE_FROM_SOURCE=1` and install Rust and the platform build tools first.
 

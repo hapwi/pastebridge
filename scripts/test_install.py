@@ -63,6 +63,7 @@ class InstallerTest(unittest.TestCase):
             "CARGO_HOME": str(self.home / ".cargo"),
             "PATH": f"{self.tools}{os.pathsep}{os.environ['PATH']}",
             "SHELL": "/bin/zsh",
+            "BASH_COMPAT": "3.2",
             "TMPDIR": str(self.root),
             "PASTEBRIDGE_INSTALL_DIR": str(self.install_dir),
             "PASTEBRIDGE_RELEASE": "v1.2.3",
@@ -127,8 +128,9 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(profile.read_text().count("export PATH="), 1)
             result = subprocess.run(
                 ["bash", "-c", '. "$1"; command -v pastebridge', "bash", str(profile)],
-                env=self.env, capture_output=True, text=True, check=True,
+                env=self.env, capture_output=True, text=True,
             )
+            self.assertEqual(result.returncode, 0, profile.read_text() + result.stdout + result.stderr)
             self.assertEqual(result.stdout.strip(), str(self.install_dir / "pastebridge"))
 
     def test_selects_each_supported_platform(self):
