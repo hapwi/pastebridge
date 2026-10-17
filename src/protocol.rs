@@ -39,13 +39,42 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Msg) -> R
 }
 
 pub async fn read_msg<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Msg> {
-    let len = reader.read_u32().await.context("connection closed")? as usize;
-    if len > MAX_MSG {
-        bail!("incoming message too large ({len} bytes)");
+    MessageReader::default().read(reader).await
+}
+
+#[derive(Default)]
+pub struct MessageReader {
+    header: [u8; 4],
+    header_read: usize,
+    body: Vec<u8>,
+    body_read: usize,
+}
+
+impl MessageReader {
+    pub async fn read<R: AsyncReadExt + Unpin>(&mut self, reader: &mut R) -> Result<Msg> {
+        while self.header_read < self.header.len() {
+            let n = reader.read(&mut self.header[self.header_read..]).await?;
+            if n == 0 {
+                bail!("connection closed during message header");
+            }
+            self.header_read += n;
+        }
+        let len = u32::from_be_bytes(self.header) as usize;
+        if len > MAX_MSG {
+            bail!("incoming message too large ({len} bytes)");
+        }
+        self.body.resize(len, 0);
+        while self.body_read < len {
+            let n = reader.read(&mut self.body[self.body_read..]).await?;
+            if n == 0 {
+                bail!("connection closed during message body");
+            }
+            self.body_read += n;
+        }
+        self.header_read = 0;
+        self.body_read = 0;
+        serde_json::from_slice(&std::mem::take(&mut self.body)).context("invalid message json")
     }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf).context("invalid message json")
 }
 
 #[cfg(test)]
@@ -74,5 +103,33 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_frame_resumes_without_losing_bytes() {
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        let mut frame = Vec::new();
+        write_msg(&mut frame, &Msg::Ping).await.unwrap();
+        let mut reader = MessageReader::default();
+        for split in [2, 6] {
+            let start = if split == 2 { 0 } else { 2 };
+            sender.write_all(&frame[start..split]).await.unwrap();
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                reader.read(&mut receiver),
+            )
+            .await
+            .is_err());
+        }
+        sender.write_all(&frame[6..]).await.unwrap();
+        assert!(matches!(
+            reader.read(&mut receiver).await.unwrap(),
+            Msg::Ping
+        ));
+        write_msg(&mut sender, &Msg::Pong).await.unwrap();
+        assert!(matches!(
+            reader.read(&mut receiver).await.unwrap(),
+            Msg::Pong
+        ));
     }
 }

@@ -67,18 +67,31 @@ pub fn run(cfg: &Config, paths: &Paths, identity: &Identity) -> Result<()> {
                 if n == 1 { "" } else { "s" }
             );
         }
-        Ok(None) | Err(_) => {}
+        Ok(None) => println!("  tailscale  not installed; local network sync is available"),
+        Err(err) => fail("tailscale", &format!("{err:#}"), &mut failed),
     }
 
     match daemon_pid {
-        Some(pid) => println!("  daemon     running  pid {pid}"),
-        None => println!("  daemon     stopped"),
+        Some(pid) if crate::service::ready_status(paths, env!("CARGO_PKG_VERSION")).is_some() => {
+            println!("  daemon     ready  pid {pid}");
+        }
+        Some(_) => fail(
+            "daemon",
+            "running but not ready; check the service logs",
+            &mut failed,
+        ),
+        None => fail(
+            "daemon",
+            "stopped; run pastebridge install-service",
+            &mut failed,
+        ),
     }
 
     println!();
     if failed > 0 {
         println!("  {failed} need attention");
         println!();
+        anyhow::bail!("{failed} diagnostic check(s) failed");
     }
     Ok(())
 }

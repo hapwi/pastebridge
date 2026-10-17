@@ -108,6 +108,12 @@ pub fn tailscale_network() -> Result<Option<TailscaleNetwork>> {
     let Some(binary) = tailscale_binary() else {
         return Ok(None);
     };
+    let status_output =
+        command_output_limited(&binary, &["status", "--json"], MAX_TAILSCALE_STATUS_BYTES)
+            .context("running `tailscale status --json`")?;
+    let status: RawTailscaleStatus =
+        serde_json::from_slice(&status_output).context("parsing Tailscale status")?;
+    require_running_tailscale(&status.backend_state)?;
     let local_output = command_output_limited(&binary, &["ip", "-4"], 1024)
         .context("running `tailscale ip -4`")?;
     let local_text = std::str::from_utf8(&local_output).context("invalid tailscale IP output")?;
@@ -118,9 +124,6 @@ pub fn tailscale_network() -> Result<Option<TailscaleNetwork>> {
         .filter(is_usable_ipv4)
         .context("Tailscale did not report a usable IPv4 address")?;
 
-    let status_output =
-        command_output_limited(&binary, &["status", "--json"], MAX_TAILSCALE_STATUS_BYTES)
-            .context("running `tailscale status --json`")?;
     parse_tailscale_status(&status_output, local_ip).map(Some)
 }
 
@@ -170,7 +173,7 @@ pub fn browse(mdns: &ServiceDaemon, service: &str) -> Result<mpsc::Receiver<Foun
     let receiver = mdns.browse(service)?;
     let (tx, rx) = mpsc::channel(32);
     std::thread::spawn(move || {
-        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(3600)) {
+        while let Ok(event) = receiver.recv() {
             if let ServiceEvent::ServiceResolved(info) = event {
                 let device_id = info.get_property_val_str("id").unwrap_or("").to_string();
                 let name = info
@@ -223,9 +226,7 @@ fn sanitize_label(s: &str) -> String {
 fn parse_tailscale_status(bytes: &[u8], local_ip: Ipv4Addr) -> Result<TailscaleNetwork> {
     let status: RawTailscaleStatus =
         serde_json::from_slice(bytes).context("parsing Tailscale status")?;
-    if status.backend_state != "Running" {
-        anyhow::bail!("Tailscale backend is not running");
-    }
+    require_running_tailscale(&status.backend_state)?;
     if status.peers.len() > MAX_TAILSCALE_PEERS {
         anyhow::bail!("Tailscale status contains too many peers");
     }
@@ -271,8 +272,17 @@ fn command_output_limited(binary: &Path, args: &[&str], max_bytes: usize) -> Res
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("capturing tailscale diagnostics")?;
+    let diagnostic_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stderr.by_ref().take(32 * 1024).read_to_end(&mut output);
+        output
+    });
     let mut stdout = child.stdout.take().context("capturing tailscale output")?;
     let reader = thread::spawn(move || {
         let mut output = Vec::new();
@@ -291,6 +301,7 @@ fn command_output_limited(binary: &Path, args: &[&str], max_bytes: usize) -> Res
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            let _ = diagnostic_reader.join();
             anyhow::bail!("tailscale command timed out");
         }
         thread::sleep(Duration::from_millis(20));
@@ -299,13 +310,41 @@ fn command_output_limited(binary: &Path, args: &[&str], max_bytes: usize) -> Res
         .join()
         .map_err(|_| anyhow::anyhow!("tailscale output reader panicked"))?;
     read_result?;
+    let diagnostic = diagnostic_reader.join().unwrap_or_default();
     if output.len() > max_bytes {
         anyhow::bail!("tailscale output exceeded the safety limit");
     }
     if !status.success() {
-        anyhow::bail!("tailscale command failed");
+        anyhow::bail!("{}", tailscale_failure(&diagnostic));
     }
     Ok(output)
+}
+
+fn require_running_tailscale(state: &str) -> Result<()> {
+    match state {
+        "Running" => Ok(()),
+        "NeedsLogin" => anyhow::bail!("Tailscale is not logged in; open Tailscale and sign in"),
+        "Stopped" => anyhow::bail!("Tailscale is disconnected; connect it to your tailnet"),
+        "NeedsMachineAuth" => anyhow::bail!("approve this device in the Tailscale admin console"),
+        _ => anyhow::bail!("Tailscale is starting or unavailable; check the Tailscale app"),
+    }
+}
+
+fn tailscale_failure(stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("permission denied")
+        || text.contains("access denied")
+        || text.contains("must be root")
+    {
+        "permission denied by Tailscale; check local Tailscale access"
+    } else if text.contains("not logged in")
+        || text.contains("needs login")
+        || text.contains("logged out")
+    {
+        "Tailscale is not logged in; open Tailscale and sign in"
+    } else {
+        "Tailscale command failed; check that the Tailscale app is running"
+    }
 }
 
 fn tailscale_binary() -> Option<PathBuf> {
@@ -346,6 +385,26 @@ fn valid_device_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailscale_diagnostics_are_actionable_without_exposing_stderr() {
+        assert_eq!(
+            tailscale_failure(b"permission denied tskey-private"),
+            "permission denied by Tailscale; check local Tailscale access"
+        );
+        assert_eq!(
+            tailscale_failure(b"not logged in tskey-private"),
+            "Tailscale is not logged in; open Tailscale and sign in"
+        );
+        assert!(require_running_tailscale("NeedsLogin")
+            .unwrap_err()
+            .to_string()
+            .contains("sign in"));
+        assert!(require_running_tailscale("Stopped")
+            .unwrap_err()
+            .to_string()
+            .contains("connect"));
+    }
 
     #[test]
     fn parses_online_tailscale_ipv4_peers() {

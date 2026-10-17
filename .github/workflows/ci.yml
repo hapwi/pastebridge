@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -24,3 +25,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y wl-clipboard xclip
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Installer regression checks
+        run: python3 scripts/test_install.py

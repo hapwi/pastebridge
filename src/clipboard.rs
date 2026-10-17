@@ -39,10 +39,26 @@ impl Clip {
     }
 }
 
+#[derive(Default)]
+struct ObservedClipboard(Option<String>);
+
+impl ObservedClipboard {
+    fn changed(&mut self, hash: String) -> bool {
+        if self.0.as_ref() == Some(&hash) {
+            return false;
+        }
+        self.0 = Some(hash);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.0 = None;
+    }
+}
+
 pub struct Clipboard {
     inner: Option<Arboard>,
-    last_hash: Option<String>,
-    ignore_hash: Option<String>,
+    observed: ObservedClipboard,
     file_identity: Option<String>,
     file_clip: Option<Clip>,
     pub backend: String,
@@ -51,12 +67,19 @@ pub struct Clipboard {
 impl Clipboard {
     pub fn open() -> Result<Self> {
         apply_wayland_env();
+        #[cfg(target_os = "linux")]
+        if is_wayland() {
+            if !has_cmd("wl-copy") || !has_cmd("wl-paste") {
+                anyhow::bail!("Wayland clipboard requires wl-clipboard (wl-copy and wl-paste)");
+            }
+        } else if !has_cmd("xclip") || std::env::var_os("DISPLAY").is_none() {
+            anyhow::bail!("X11 clipboard requires xclip and a graphical session with DISPLAY set");
+        }
         let inner = Arboard::new().ok();
         let backend = detect_backend(inner.is_some());
         Ok(Self {
             inner,
-            last_hash: None,
-            ignore_hash: None,
+            observed: ObservedClipboard::default(),
             file_identity: None,
             file_clip: None,
             backend,
@@ -64,30 +87,28 @@ impl Clipboard {
     }
 
     pub fn poll(&mut self) -> Option<Clip> {
-        let clip = self.read()?;
+        let Some(clip) = self.read() else {
+            self.observed.reset();
+            return None;
+        };
         if clip.bytes.is_empty() {
             return None;
         }
         let hash = clip.hash();
-        if self.last_hash.as_deref() == Some(&hash) {
+        if !self.observed.changed(hash) {
             return None;
         }
-        if self.ignore_hash.as_deref() == Some(&hash) {
-            self.last_hash = Some(hash);
-            return None;
-        }
-        self.last_hash = Some(hash);
         Some(clip)
     }
 
     pub fn set(&mut self, clip: &Clip) -> Result<()> {
         self.clear_file_cache();
-        self.ignore_hash = Some(clip.hash());
-        self.last_hash = self.ignore_hash.clone();
         match clip.mime.as_str() {
             "image/png" => self.set_image(&clip.bytes),
             _ => self.set_text(String::from_utf8_lossy(&clip.bytes).as_ref()),
-        }
+        }?;
+        self.observed.changed(clip.hash());
+        Ok(())
     }
 
     /// Clears the clipboard only when its current supported content is exactly `expected`.
@@ -102,6 +123,7 @@ impl Clipboard {
             return Ok(false);
         }
         self.clear()?;
+        self.observed.reset();
         Ok(true)
     }
 
@@ -503,6 +525,9 @@ pub fn wait_for_display() {
         if apply_wayland_env() {
             return;
         }
+        if std::env::var_os("DISPLAY").is_some_and(|value| !value.is_empty()) {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(250));
@@ -691,55 +716,20 @@ fn wl_paste_file_paths() -> Option<Vec<PathBuf>> {
 }
 
 fn wl_copy_text(text: &str) -> Result<()> {
-    let mut child = wl_cmd("wl-copy")
-        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("wl-copy failed")
-    }
+    let command = wl_cmd("wl-copy").context("no wl-copy")?;
+    write_command(command, text.as_bytes(), Duration::from_secs(3))
 }
 
 fn wl_copy_image(png: &[u8]) -> Result<()> {
-    let mut child = wl_cmd("wl-copy")
-        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
-        .args(["-t", "image/png"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(png)?;
-    }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("wl-copy image failed")
-    }
+    let mut command = wl_cmd("wl-copy").context("no wl-copy")?;
+    command.args(["-t", "image/png"]);
+    write_command(command, png, Duration::from_secs(3))
 }
 
 fn wl_clear() -> Result<()> {
-    let status = wl_cmd("wl-copy")
-        .ok_or_else(|| anyhow::anyhow!("no wl-copy"))?
-        .arg("--clear")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("wl-copy clear failed")
-    }
+    let mut command = wl_cmd("wl-copy").context("no wl-copy")?;
+    command.arg("--clear");
+    write_command(command, &[], Duration::from_secs(3))
 }
 
 fn xclip_paste_text() -> Option<String> {
@@ -793,42 +783,18 @@ fn xclip_copy_text(text: &str) -> Result<()> {
     if is_wayland() || !has_cmd("xclip") {
         anyhow::bail!("no xclip");
     }
-    let mut child = Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("xclip failed")
-    }
+    let mut command = Command::new("xclip");
+    command.args(["-selection", "clipboard"]);
+    write_command(command, text.as_bytes(), Duration::from_secs(3))
 }
 
 fn xclip_copy_image(png: &[u8]) -> Result<()> {
     if is_wayland() || !has_cmd("xclip") {
         anyhow::bail!("no xclip");
     }
-    let mut child = Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "image/png"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(png)?;
-    }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("xclip image failed")
-    }
+    let mut command = Command::new("xclip");
+    command.args(["-selection", "clipboard", "-t", "image/png"]);
+    write_command(command, png, Duration::from_secs(3))
 }
 
 fn xclip_clear() -> Result<()> {
@@ -850,20 +816,11 @@ fn pb_copy_text(text: &str) -> Result<()> {
     if !cfg!(target_os = "macos") {
         anyhow::bail!("not macos");
     }
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("pbcopy failed")
-    }
+    write_command(
+        Command::new("pbcopy"),
+        text.as_bytes(),
+        Duration::from_secs(3),
+    )
 }
 
 fn pb_clear() -> Result<()> {
@@ -871,6 +828,40 @@ fn pb_clear() -> Result<()> {
         anyhow::bail!("not macos");
     }
     pb_copy_text("")
+}
+
+fn write_command(mut command: Command, bytes: &[u8], timeout: Duration) -> Result<()> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("opening clipboard helper stdin")?;
+    let bytes = bytes.to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&bytes));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            anyhow::bail!("clipboard helper timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("clipboard writer stopped"))??;
+    if !status.success() {
+        anyhow::bail!("clipboard helper failed ({status})");
+    }
+    Ok(())
 }
 
 fn read_command_output(mut command: Command, max_bytes: usize) -> Option<Vec<u8>> {
@@ -1040,6 +1031,32 @@ mod tests {
     };
     use image::{ImageBuffer, ImageFormat, RgbaImage};
     use std::io::Cursor;
+
+    #[test]
+    fn a_received_copy_can_be_copied_again_after_a_local_change() {
+        let mut observed = super::ObservedClipboard::default();
+        assert!(observed.changed("received A".into()));
+        assert!(!observed.changed("received A".into()));
+        assert!(observed.changed("local B".into()));
+        assert!(observed.changed("received A".into()));
+        observed.reset();
+        assert!(observed.changed("received A".into()));
+    }
+
+    #[test]
+    fn a_blocked_clipboard_writer_has_a_deadline() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exec sleep 10"]);
+        let started = std::time::Instant::now();
+        let error = super::write_command(
+            command,
+            &vec![0; 1024 * 1024],
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     fn clip(mime: &str, bytes: &[u8]) -> Clip {
         Clip {

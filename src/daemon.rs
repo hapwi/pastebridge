@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 #[cfg(unix)]
@@ -20,7 +20,7 @@ use crate::config::{parse_addr, Config, Paths};
 use crate::crypto::device_id_from_cert;
 use crate::discovery::{self, SERVICE};
 use crate::identity::{Identity, PeerList};
-use crate::sync::{self, IncomingClip, OutgoingClip};
+use crate::sync::{self, IncomingClipboard, OutgoingClip, SessionOptions};
 use crate::tls::{self, peer_cert, PinStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +35,12 @@ pub struct Status {
     pub last_sent: Option<String>,
     pub last_received: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,13 +52,20 @@ pub struct PeerStatus {
 }
 
 #[derive(Clone)]
+struct Session {
+    connection: quinn::Connection,
+    ready: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
 struct SessionConnector {
     endpoint: quinn::Endpoint,
     identity: Identity,
     out_tx: broadcast::Sender<OutgoingClip>,
-    in_tx: mpsc::Sender<IncomingClip>,
-    connected: Arc<Mutex<HashMap<String, quinn::Connection>>>,
-    max_payload_bytes: usize,
+    incoming: IncomingClipboard,
+    connected: Arc<Mutex<HashMap<String, Session>>>,
+    options: SessionOptions,
+    last_err: Arc<Mutex<Option<String>>>,
 }
 
 pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
@@ -110,69 +123,52 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
     info!("clipboard backend: {}", clipboard.backend);
 
     let (out_tx, _) = broadcast::channel::<OutgoingClip>(16);
-    let (in_tx, mut in_rx) = mpsc::channel::<IncomingClip>(16);
-    let connected: Arc<Mutex<HashMap<String, quinn::Connection>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let incoming = IncomingClipboard::default();
+    let connected: Arc<Mutex<HashMap<String, Session>>> = Arc::new(Mutex::new(HashMap::new()));
     let last_sent = Arc::new(Mutex::new(None::<String>));
     let last_recv = Arc::new(Mutex::new(None::<String>));
     let last_err = Arc::new(Mutex::new(None::<String>));
+    let clipboard_tick = Arc::new(Mutex::new(None::<Instant>));
     let peers = Arc::new(Mutex::new(peers));
 
-    // Incoming QUIC
+    let connector = SessionConnector {
+        endpoint: client_endpoint.clone(),
+        identity: identity.clone(),
+        out_tx: out_tx.clone(),
+        incoming: incoming.clone(),
+        connected: connected.clone(),
+        options: SessionOptions {
+            max_payload_bytes: cfg.max_payload_bytes,
+            sync_images: cfg.sync_images,
+        },
+        last_err: last_err.clone(),
+    };
     {
         let endpoint = endpoint.clone();
-        let identity = identity.clone();
-        let out_tx = out_tx.clone();
-        let in_tx = in_tx.clone();
-        let connected = connected.clone();
+        let connector = connector.clone();
         let pins = pins.clone();
-        let max_payload_bytes = cfg.max_payload_bytes;
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
-                match incoming.await {
-                    Ok(conn) => {
-                        let Ok(cert) = peer_cert(&conn) else {
-                            warn!("rejected connection without certificate");
-                            continue;
-                        };
-                        if !pins.contains(cert.as_ref()) {
-                            warn!(
-                                "rejected unpinned connection from {}",
-                                conn.remote_address()
-                            );
-                            continue;
+                let connector = connector.clone();
+                let pins = pins.clone();
+                tokio::spawn(async move {
+                    match incoming.await {
+                        Ok(conn) => {
+                            let Ok(cert) = peer_cert(&conn) else { return };
+                            if !pins.contains(cert.as_ref()) {
+                                conn.close(0u32.into(), b"unpinned certificate");
+                                return;
+                            }
+                            let peer_id = device_id_from_cert(cert.as_ref());
+                            if connector.identity.device_id < peer_id {
+                                conn.close(0u32.into(), b"peer uses the client connection");
+                                return;
+                            }
+                            start_session(&connector, conn, false, peer_id).await;
                         }
-                        let peer_id = device_id_from_cert(cert.as_ref());
-                        if identity.device_id < peer_id {
-                            conn.close(0u32.into(), b"peer uses the client connection");
-                            continue;
-                        }
-                        let mut guard = connected.lock().await;
-                        if guard.contains_key(&peer_id) {
-                            conn.close(0u32.into(), b"duplicate connection");
-                            continue;
-                        }
-                        guard.insert(peer_id.clone(), conn.clone());
-                        drop(guard);
-                        let identity = identity.clone();
-                        let outgoing = out_tx.subscribe();
-                        let incoming = in_tx.clone();
-                        let connected = connected.clone();
-                        tokio::spawn(async move {
-                            let _ = sync::run_session(
-                                conn,
-                                false,
-                                identity,
-                                outgoing,
-                                incoming,
-                                max_payload_bytes,
-                            )
-                            .await;
-                            connected.lock().await.remove(&peer_id);
-                        });
+                        Err(err) => debug!("incoming handshake failed: {err}"),
                     }
-                    Err(err) => warn!("incoming handshake failed: {err}"),
-                }
+                });
             }
         });
     }
@@ -181,14 +177,7 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
     if let Some(mdns) = mdns.as_ref() {
         if let Ok(mut browse) = discovery::browse(mdns, SERVICE) {
             let our_id = identity.device_id.clone();
-            let connector = SessionConnector {
-                endpoint: client_endpoint.clone(),
-                identity: identity.clone(),
-                out_tx: out_tx.clone(),
-                in_tx: in_tx.clone(),
-                connected: connected.clone(),
-                max_payload_bytes: cfg.max_payload_bytes,
-            };
+            let connector = connector.clone();
             let peers = peers.clone();
             tokio::spawn(async move {
                 while let Some(found) = browse.recv().await {
@@ -219,67 +208,68 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
 
     // Periodic reconnect using saved addresses, static peers, and Tailscale.
     {
-        let connector = SessionConnector {
-            endpoint: client_endpoint.clone(),
-            identity: identity.clone(),
-            out_tx: out_tx.clone(),
-            in_tx: in_tx.clone(),
-            connected: connected.clone(),
-            max_payload_bytes: cfg.max_payload_bytes,
-        };
+        let connector = connector.clone();
         let peers = peers.clone();
         let our_id = identity.device_id.clone();
         let static_peers = cfg.static_peers.clone();
         let port = cfg.port;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 let snapshot = peers.lock().await.peers.clone();
+                let mut targets = HashMap::new();
                 for peer in snapshot {
-                    if connector
-                        .connected
-                        .lock()
-                        .await
-                        .contains_key(&peer.device_id)
+                    if peer.device_id <= our_id
+                        || connector
+                            .connected
+                            .lock()
+                            .await
+                            .contains_key(&peer.device_id)
                     {
                         continue;
                     }
-                    let should_dial = peer.device_id > our_id;
-                    if should_dial {
-                        if let Some(addr) = peer.last_addr.as_deref() {
-                            if let Ok(addr) = parse_addr(addr, port) {
-                                try_connect(&connector, addr, &peer.device_id).await;
-                            }
-                        }
+                    if let Some(addr) = peer
+                        .last_addr
+                        .as_deref()
+                        .and_then(|addr| parse_addr(addr, port).ok())
+                    {
+                        targets.insert(addr, peer.device_id);
                     }
                 }
                 for spec in &static_peers {
                     if let Ok(addr) = parse_addr(spec, port) {
-                        try_connect(&connector, addr, spec).await;
+                        targets.entry(addr).or_insert_with(|| spec.clone());
                     }
                 }
                 if connector.connected.lock().await.len() < peers.lock().await.peers.len() {
-                    let tailscale = tokio::task::spawn_blocking(discovery::tailscale_network).await;
-                    if let Ok(Ok(Some(network))) = tailscale {
-                        let limit = Arc::new(Semaphore::new(16));
-                        let mut attempts = tokio::task::JoinSet::new();
-                        for peer in network.pairable_peers() {
-                            let addr = SocketAddr::from((peer.ip, port));
-                            let connector = connector.clone();
-                            let limit = limit.clone();
-                            attempts.spawn(async move {
-                                let Ok(_permit) = limit.acquire_owned().await else {
-                                    return;
-                                };
-                                try_connect(&connector, addr, &addr.to_string()).await;
-                            });
-                        }
-                        while let Some(result) = attempts.join_next().await {
-                            if let Err(err) = result {
-                                debug!("Tailscale connection task failed: {err}");
+                    match tokio::task::spawn_blocking(discovery::tailscale_network).await {
+                        Ok(Ok(Some(network))) => {
+                            for peer in network.pairable_peers() {
+                                let addr = SocketAddr::from((peer.ip, port));
+                                targets.entry(addr).or_insert_with(|| addr.to_string());
                             }
                         }
+                        Ok(Err(err)) => debug!("Tailscale discovery unavailable: {err:#}"),
+                        _ => {}
+                    }
+                }
+                let limit = Arc::new(Semaphore::new(16));
+                let mut attempts = tokio::task::JoinSet::new();
+                for (addr, peer_key) in targets {
+                    let connector = connector.clone();
+                    let limit = limit.clone();
+                    attempts.spawn(async move {
+                        let Ok(_permit) = limit.acquire_owned().await else {
+                            return;
+                        };
+                        try_connect(&connector, addr, &peer_key).await;
+                    });
+                }
+                while let Some(result) = attempts.join_next().await {
+                    if let Err(err) = result {
+                        warn!("reconnection task failed: {err}");
                     }
                 }
             }
@@ -308,10 +298,10 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                         if let Ok(new_pins) = list.pins() {
                             pins.replace(new_pins);
                         }
-                        connected.lock().await.retain(|peer_id, connection| {
+                        connected.lock().await.retain(|peer_id, session| {
                             let keep = list.get(peer_id).is_some();
                             if !keep {
-                                connection.close(0u32.into(), b"peer unpaired");
+                                session.connection.close(0u32.into(), b"peer unpaired");
                             }
                             keep
                         });
@@ -323,24 +313,15 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
         });
     }
 
-    // Bridge the async network receiver to the clipboard's owning thread.
-    let (clipboard_in_tx, clipboard_in_rx) = std_mpsc::channel::<IncomingClip>();
-    tokio::spawn(async move {
-        while let Some(clip) = in_rx.recv().await {
-            if clipboard_in_tx.send(clip).is_err() {
-                break;
-            }
-        }
-    });
-
     // Poll, apply, and expire on one real thread: NSPasteboard / Wayland types
     // are often !Send, and one owner keeps remote echo suppression effective.
-    {
+    let clipboard_thread = {
         let out_tx = out_tx.clone();
         let identity = identity.clone();
         let last_sent = last_sent.clone();
         let last_recv = last_recv.clone();
         let last_err = last_err.clone();
+        let clipboard_tick = clipboard_tick.clone();
         let interval = Duration::from_millis(cfg.poll_interval_ms.max(150));
         let max_bytes = cfg.max_payload_bytes;
         let sync_images = cfg.sync_images;
@@ -352,6 +333,7 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                 let mut next_poll = Instant::now();
                 let mut pending_expiry = None::<(crate::clipboard::Clip, Instant)>;
                 loop {
+                    *clipboard_tick.blocking_lock() = Some(Instant::now());
                     let current_time = Instant::now();
                     if current_time >= next_poll {
                         if let Some(clip) = clipboard.poll() {
@@ -403,11 +385,12 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                         .map(|(_, deadline)| next_poll.min(*deadline))
                         .unwrap_or(next_poll);
                     let timeout = wake_at.saturating_duration_since(Instant::now());
-                    let incoming = match clipboard_in_rx.recv_timeout(timeout) {
-                        Ok(clip) => clip,
-                        Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                    let Some(incoming) = incoming.recv_timeout(timeout) else {
+                        continue;
                     };
+                    if incoming.mime == "image/png" && !sync_images {
+                        continue;
+                    }
                     let applied = crate::clipboard::Clip {
                         mime: incoming.mime,
                         bytes: incoming.bytes,
@@ -427,8 +410,8 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                     }
                 }
             })
-            .context("starting clipboard thread")?;
-    }
+            .context("starting clipboard thread")?
+    };
 
     // Status file
     {
@@ -439,6 +422,7 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
         let last_sent = last_sent.clone();
         let last_recv = last_recv.clone();
         let last_err = last_err.clone();
+        let clipboard_tick = clipboard_tick.clone();
         let backend = {
             Clipboard::open()
                 .map(|c| c.backend)
@@ -462,7 +446,9 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                         .peers
                         .iter()
                         .map(|p| PeerStatus {
-                            connected: connected_set.contains_key(&p.device_id),
+                            connected: connected_set
+                                .get(&p.device_id)
+                                .is_some_and(|session| session.ready.load(Ordering::Acquire)),
                             device_id: p.device_id.clone(),
                             name: p.name.clone(),
                             last_addr: p.last_addr.clone(),
@@ -471,6 +457,12 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
                     last_sent: last_sent.lock().await.clone(),
                     last_received: last_recv.lock().await.clone(),
                     last_error: last_err.lock().await.clone(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    updated_at: now(),
+                    ready: clipboard_tick
+                        .lock()
+                        .await
+                        .is_some_and(|tick| tick.elapsed() < Duration::from_secs(60)),
                 };
                 if let Ok(json) = serde_json::to_string_pretty(&status) {
                     let _ = crate::config::write_secret_file(&paths.status_file, &json);
@@ -480,7 +472,30 @@ pub async fn run(cfg: Config, paths: Paths, identity: Identity) -> Result<()> {
     }
 
     info!("pastebridge is running — copy on one computer, paste on the other");
-    tokio::signal::ctrl_c().await.ok();
+    let worker_health = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let stalled = clipboard_tick
+                .lock()
+                .await
+                .is_some_and(|tick| tick.elapsed() >= Duration::from_secs(60));
+            if clipboard_thread.is_finished() || stalled {
+                return Err(anyhow::anyhow!(
+                    "clipboard worker stopped or became unresponsive"
+                ));
+            }
+        }
+    };
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+            failure = worker_health => return failure,
+        }
+    }
     info!("shutting down");
     endpoint.close(0u32.into(), b"bye");
     Ok(())
@@ -502,37 +517,66 @@ async fn try_connect(connector: &SessionConnector, addr: SocketAddr, peer_key: &
                     conn.close(0u32.into(), b"peer uses the client connection");
                     return;
                 }
-                {
-                    let mut guard = connector.connected.lock().await;
-                    if guard.contains_key(&peer_id) {
-                        conn.close(0u32.into(), b"duplicate connection");
-                        return;
-                    }
-                    guard.insert(peer_id.clone(), conn.clone());
-                }
-                let identity = connector.identity.clone();
-                let outgoing = connector.out_tx.subscribe();
-                let incoming = connector.in_tx.clone();
-                let connected = connector.connected.clone();
-                let max_payload_bytes = connector.max_payload_bytes;
-                tokio::spawn(async move {
-                    let _ = sync::run_session(
-                        conn,
-                        true,
-                        identity,
-                        outgoing,
-                        incoming,
-                        max_payload_bytes,
-                    )
-                    .await;
-                    connected.lock().await.remove(&peer_id);
-                });
+                start_session(connector, conn, true, peer_id).await;
             }
             Ok(Err(err)) => tracing::debug!("connect {addr} failed: {err}"),
             Err(_) => tracing::debug!("connect {addr} timed out"),
         },
         Err(err) => tracing::debug!("dial {addr} failed: {err}"),
     }
+}
+
+async fn start_session(
+    connector: &SessionConnector,
+    conn: quinn::Connection,
+    as_client: bool,
+    peer_id: String,
+) {
+    let ready = Arc::new(AtomicBool::new(false));
+    {
+        let mut sessions = connector.connected.lock().await;
+        if sessions.contains_key(&peer_id) {
+            conn.close(0u32.into(), b"duplicate connection");
+            return;
+        }
+        sessions.insert(
+            peer_id.clone(),
+            Session {
+                connection: conn.clone(),
+                ready: ready.clone(),
+            },
+        );
+    }
+    let connector = connector.clone();
+    tokio::spawn(async move {
+        let result = sync::run_session(
+            conn.clone(),
+            as_client,
+            connector.identity,
+            connector.out_tx.subscribe(),
+            connector.incoming,
+            connector.options,
+            ready,
+        )
+        .await;
+        if let Err(err) = result {
+            let detail = format!("session with {peer_id}: {err}");
+            if conn.close_reason().is_some() {
+                info!("peer {peer_id} disconnected; will retry");
+            } else {
+                warn!("{detail}");
+                *connector.last_err.lock().await = Some(detail);
+            }
+        }
+        conn.close(0u32.into(), b"session ended");
+        let mut sessions = connector.connected.lock().await;
+        if sessions
+            .get(&peer_id)
+            .is_some_and(|session| session.connection.stable_id() == conn.stable_id())
+        {
+            sessions.remove(&peer_id);
+        }
+    });
 }
 
 fn lock_pid(paths: &Paths) -> Result<std::fs::File> {

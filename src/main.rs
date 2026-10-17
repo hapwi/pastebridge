@@ -110,25 +110,21 @@ fn print_status(paths: &Paths, identity: &Identity) -> Result<()> {
     println!("  {}", identity.name);
     if daemon::running_pid(paths).is_none() {
         println!("  daemon     stopped");
-    } else if let Ok(text) = std::fs::read_to_string(&paths.status_file) {
-        if let Ok(status) = serde_json::from_str::<daemon::Status>(&text) {
-            println!("  daemon     running");
-            for peer in status.peers {
-                let state = if peer.connected {
-                    "connected"
-                } else {
-                    "waiting"
-                };
-                println!("  {:<10} {state}", peer.name);
-            }
-            if let Some(err) = status.last_error {
-                println!("! error      {err}");
-            }
-        } else {
-            println!("  daemon     running");
+    } else if let Some(status) = service::ready_status(paths, env!("CARGO_PKG_VERSION")) {
+        println!("  daemon     ready  {}", status.version);
+        for peer in status.peers {
+            let state = if peer.connected {
+                "connected"
+            } else {
+                "waiting"
+            };
+            println!("  {:<10} {state}", peer.name);
+        }
+        if let Some(err) = status.last_error {
+            println!("! last error {err}");
         }
     } else {
-        println!("  daemon     running");
+        println!("  daemon     starting or unhealthy; run pastebridge doctor");
     }
     println!();
     Ok(())

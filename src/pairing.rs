@@ -310,7 +310,7 @@ async fn wait_for_peer(
         }
     }
 
-    if tailscale.is_some() {
+    {
         let refresh_targets = targets.clone();
         let refresh_selected = selected.clone();
         tokio::spawn(async move {

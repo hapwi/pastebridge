@@ -13,6 +13,13 @@ use crate::identity::Identity;
 
 const ALPN: &[u8] = b"pastebridge/1";
 
+fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into()?));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    Ok(Arc::new(transport))
+}
+
 #[derive(Clone, Debug)]
 pub struct PinStore {
     inner: Arc<RwLock<Vec<[u8; 32]>>>,
@@ -66,10 +73,7 @@ pub fn server_config(
     crypto.max_early_data_size = 0;
 
     let mut server = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(45).try_into()?));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-    server.transport_config(Arc::new(transport));
+    server.transport_config(transport_config()?);
     Ok(server)
 }
 
@@ -96,9 +100,9 @@ pub fn client_config(
     };
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
-    Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
-        crypto,
-    )?)))
+    let mut client = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    client.transport_config(transport_config()?);
+    Ok(client)
 }
 
 pub fn pairing_server(identity: &Identity) -> Result<ServerConfig> {
@@ -113,10 +117,7 @@ pub fn pairing_server(identity: &Identity) -> Result<ServerConfig> {
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     crypto.max_early_data_size = 0;
     let mut server = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(45).try_into()?));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-    server.transport_config(Arc::new(transport));
+    server.transport_config(transport_config()?);
     Ok(server)
 }
 

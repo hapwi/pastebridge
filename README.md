@@ -43,12 +43,18 @@ No account. No cloud upload. No extra window.
 **1. Install** on macOS or Linux:
 
 ```bash
-curl -fsSL https://hapwi.github.io/install/pastebridge.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hapwi/pastebridge/main/install.sh | bash
 ```
 
-Downloads a prebuilt binary and enables the user-level login service. Rust is not required.
+Downloads a prebuilt binary for Apple Silicon or Intel macOS, or ARM64 or x86-64 Linux. The installer verifies its checksum and version, then enables the user-level login service and waits for the daemon to become ready. Rust, Bun, and Git are not required.
 
-**2. Pair** both computers:
+Pastebridge starts automatically **when you log in to your desktop**. It does not run before login. If a paired computer is off, Pastebridge keeps running and retries when that computer returns. Tailscale must also be connected when the computers are on different networks.
+
+On a first installation in an interactive terminal, setup starts pairing. Run the command on the other computer too. If pairing has already finished, skip step 2. Existing pairings survive reinstallation.
+
+If the installer adds Pastebridge to your PATH, open a new terminal before using the short `pastebridge` command. Setup uses the full executable path and continues in the current terminal.
+
+**2. Pair** both computers if setup did not already pair them:
 
 ```bash
 pastebridge pair
@@ -58,7 +64,8 @@ Both screens show an 8-digit code derived from the TLS certificates. If the code
 
 **3. Use it.** Copy text, a screenshot, or a photo on one machine. Paste on the other with your usual shortcut.
 
-> **Linux (Wayland):** Install `wl-clipboard` — the installer tries to add it automatically.  
+> **Linux:** The installer tries to add `wl-clipboard` on Wayland or `xclip` on X11. Run setup from a terminal in your desktop session.
+>
 > **macOS:** Allow clipboard and local network access if the OS prompts you.
 
 ---
@@ -100,7 +107,21 @@ pastebridge list            # paired devices
 pastebridge unpair <id>     # forget a device
 ```
 
-`pastebridge update` checks GitHub for a newer version, shows `0.1.3 → 0.1.4`, and asks `update? [y/N]` before replacing the binary. Pass `-y` to skip the prompt. If the login service is running, it restarts onto the new build.
+`pastebridge update` checks GitHub for a newer version, shows the version change, and asks `update? [y/N]` before replacing the binary. Pass `-y` to skip the prompt. The update requires a matching checksum and verifies that the downloaded executable reports the requested version. If the daemon is running, the update restarts the login service and waits for that version to become ready. If activation fails, it restores the previous executable and attempts to restart the previous version.
+
+`pastebridge status` distinguishes a ready daemon from a process that is starting or unhealthy. A peer is connected only after its application handshake completes. `pastebridge doctor` reports Tailscale login, permission, and timeout failures, and returns a nonzero exit status when a diagnostic check fails. An offline peer is normal and does not make the daemon unhealthy.
+
+### Installer options
+
+Set `PASTEBRIDGE_RELEASE=v0.1.7` to select an exact release. The default resolves GitHub's latest release once and downloads all assets from that version. The old `stable` setting also resolves to the latest versioned release. Downloads never fall back to a source build automatically.
+
+Set `PASTEBRIDGE_NO_PAIR=1` to defer pairing. Set `PASTEBRIDGE_INSTALL_DIR` to choose a different binary directory. To build from source, use `PASTEBRIDGE_FROM_SOURCE=1` and install Rust and the platform build tools first.
+
+### Release maintenance
+
+Release builds validate the project on Linux, Apple Silicon macOS, and Intel macOS before packaging all four supported targets. A `v*` tag must match `Cargo.toml`. Publishing creates a draft, uploads the complete binary set and checksums, then makes the release public. A failed draft publication can be retried. Published versioned assets are not overwritten. Pushes to `main` validate and build artifacts without changing the public release.
+
+Run `python3 scripts/test_install.py` to exercise the piped installer against local HTTP fixtures. These checks use disposable homes and fake executables. They do not install a real login service or verify macOS permissions.
 
 ---
 
@@ -139,7 +160,7 @@ static_peers = ["100.64.0.2:27419"]
 
 `bind_address = "0.0.0.0"` is required for automatic LAN and Tailscale connectivity. Set a specific address only when you intentionally want to limit Pastebridge to one interface.
 
-Set `sync_images = false` to sync text only. Set `clipboard_ttl_seconds = 0` to keep remote clipboard items indefinitely, or another value up to one year. Restart the Pastebridge service after changing configuration.
+Set `sync_images = false` to block both outgoing and incoming images. Set `clipboard_ttl_seconds = 0` to keep remote clipboard items indefinitely, or another value up to one year. Restart the Pastebridge service after changing configuration.
 
 Payloads are capped at 8 MB (`max_payload_bytes`). That covers everyday screenshots and photos; oversized clipboard items are skipped.
 
